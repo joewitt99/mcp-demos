@@ -20,6 +20,7 @@ Configuration (all via environment variables):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -55,6 +56,10 @@ class OktaJWTVerifier(JWTVerifier):
                 return None
             # Surface cid as the canonical client_id on the AccessToken.
             access.client_id = str(cid)
+        logger.info(
+            "Token verified. Claims: %s",
+            json.dumps(access.claims, default=str, sort_keys=True),
+        )
         return access
 
 
