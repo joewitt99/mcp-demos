@@ -20,6 +20,7 @@ Configuration (all via environment variables):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -27,6 +28,20 @@ import os
 from fastmcp.server.auth.providers.jwt import AccessToken, JWTVerifier
 
 logger = logging.getLogger(__name__)
+
+
+def _peek_jwt_claims(token: str) -> dict | None:
+    """Decode a JWT's payload WITHOUT verifying its signature.
+
+    Diagnostic-only — used to surface why a token was rejected (e.g. wrong
+    audience, expired, wrong issuer). Never trust these claims for auth.
+    """
+    try:
+        _, payload_b64, _ = token.split(".", 2)
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
 
 
 class OktaJWTVerifier(JWTVerifier):
@@ -45,6 +60,20 @@ class OktaJWTVerifier(JWTVerifier):
     async def verify_token(self, token: str) -> AccessToken | None:
         access = await super().verify_token(token)
         if access is None:
+            peek = _peek_jwt_claims(token)
+            if peek is None:
+                logger.warning("Token rejected and is not a parseable JWT.")
+            else:
+                logger.warning(
+                    "Token rejected. Unverified claims (DIAGNOSTIC ONLY): "
+                    "iss=%s aud=%s cid=%s azp=%s exp=%s scp=%s sub=%s. "
+                    "Server expects iss=%s aud=%s cid=%s.",
+                    peek.get("iss"), peek.get("aud"),
+                    peek.get("cid"), peek.get("azp"),
+                    peek.get("exp"), peek.get("scp"), peek.get("sub"),
+                    self.issuer, self.audience,
+                    self._expected_client_id or "<any>",
+                )
             return None
         if self._expected_client_id:
             cid = access.claims.get("cid") or access.claims.get("client_id")
