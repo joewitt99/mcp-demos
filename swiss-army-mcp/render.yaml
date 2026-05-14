@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: swiss-army-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      # ---- Okta auth (required unless MCP_AUTH_DISABLED=true) ----
+      - key: OKTA_ISSUER
+        sync: false                          # e.g. https://dev-123456.okta.com/oauth2/default
+      - key: OKTA_AUDIENCE
+        sync: false                          # e.g. api://default
+      - key: OKTA_CLIENT_ID
+        sync: false                          # optional: restrict to one Okta app
+      - key: OKTA_DOMAIN
+        sync: false                          # optional: e.g. dev-123456.okta.com
+      - key: OKTA_JWKS_URI
+        sync: false                          # optional override
+      - key: OKTA_REQUIRED_SCOPES
+        sync: false                          # optional: comma-separated
+      - key: MCP_BASE_URL
+        sync: false                          # optional: public URL of this service
+      - key: MCP_AUTH_DISABLED
+        value: "false"                       # set to "true" to disable auth
