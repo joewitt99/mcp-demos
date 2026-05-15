@@ -8,6 +8,8 @@ services:
     envVars:
       - key: HOST
         value: 0.0.0.0
+      - key: MCP_LIST_PAGE_SIZE
+        value: "30"
       # ---- Okta auth (required unless MCP_AUTH_DISABLED=true) ----
       - key: OKTA_ISSUER
         sync: false                          # e.g. https://dev-123456.okta.com/oauth2/default

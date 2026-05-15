@@ -39,14 +39,20 @@ from okta_auth import build_okta_auth
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
+# MCP-spec cursor pagination for list operations (tools/resources/prompts).
+# Clients send an opaque `cursor`; responses include `nextCursor` until exhausted.
+LIST_PAGE_SIZE = int(os.environ.get("MCP_LIST_PAGE_SIZE", "30"))
+
 mcp = FastMCP(
     name="swiss-army-mcp",
     instructions=(
         "A 100-tool Swiss Army Knife demo MCP server. Tools are namespaced with a "
         "category prefix: text_, math_, encode_, hash_, time_, rand_, color_, "
-        "unit_, data_, fun_."
+        "unit_, data_, fun_. tools/list is paginated; follow nextCursor to "
+        "retrieve all 100 tools."
     ),
     auth=build_okta_auth(),
+    list_page_size=LIST_PAGE_SIZE,
 )
 
 
