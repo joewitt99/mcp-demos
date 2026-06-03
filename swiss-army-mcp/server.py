@@ -921,7 +921,7 @@ def fun_emoji_clock(iso_time: str | None = None) -> str:
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
-    # Stateless HTTP: no Mcp-Session-Id is issued, so clients can't get stuck
-    # holding a stale session across server restarts/redeploys. All tools here
-    # are pure functions, so there's no session state to lose.
-    mcp.run(transport="http", host=host, port=port, stateless_http=True)
+    # Stateful HTTP (default): server issues an Mcp-Session-Id on initialize
+    # and returns 404 for requests carrying an unknown session ID, per the
+    # MCP Streamable HTTP spec. Useful for exercising client-side recovery.
+    mcp.run(transport="http", host=host, port=port)
