@@ -2,15 +2,18 @@
 
 Validates the incoming `Authorization: Bearer <jwt>` header against an Okta
 custom authorization server using JWKS-based signature verification, plus
-issuer/audience/expiration checks. When OKTA_CLIENT_ID is set, the token's
-`cid` claim must match as well — restricting access to a specific Okta app.
+issuer/audience/expiration checks. When OKTA_CLIENT_IDS is set, the token's
+`cid` claim must match one of the listed values — restricting access to a
+specific set of Okta apps.
 
 Configuration (all via environment variables):
 
     OKTA_ISSUER         REQUIRED.  Full issuer URL of the custom auth server,
                                    e.g. https://dev-123456.okta.com/oauth2/default
     OKTA_AUDIENCE       REQUIRED.  Expected `aud` claim, e.g. api://default
-    OKTA_CLIENT_ID      Optional.  If set, the token's `cid` claim must match.
+    OKTA_CLIENT_IDS     Optional.  Comma-separated list of allowed Okta app
+                                   client IDs. If set, the token's `cid` claim
+                                   must match one of them.
     OKTA_JWKS_URI       Optional.  Defaults to {OKTA_ISSUER}/v1/keys
     OKTA_REQUIRED_SCOPES  Optional. Comma-separated scopes the token must have.
     OKTA_DOMAIN         Optional.  Informational, e.g. dev-123456.okta.com
@@ -50,12 +53,13 @@ class OktaJWTVerifier(JWTVerifier):
     Okta access tokens identify the calling app via the `cid` claim (not the
     standard OAuth `client_id`). The base verifier already validates the
     signature, issuer, audience, and expiration; this subclass adds an
-    optional equality check on `cid` so the server can be locked to one app.
+    optional allow-list check on `cid` so the server can be locked to one or
+    more specific Okta apps.
     """
 
-    def __init__(self, *, expected_client_id: str | None = None, **kwargs):
+    def __init__(self, *, expected_client_ids: list[str] | None = None, **kwargs):
         super().__init__(**kwargs)
-        self._expected_client_id = expected_client_id
+        self._expected_client_ids = expected_client_ids
 
     async def verify_token(self, token: str) -> AccessToken | None:
         access = await super().verify_token(token)
@@ -72,15 +76,15 @@ class OktaJWTVerifier(JWTVerifier):
                     peek.get("cid"), peek.get("azp"),
                     peek.get("exp"), peek.get("scp"), peek.get("sub"),
                     self.issuer, self.audience,
-                    self._expected_client_id or "<any>",
+                    self._expected_client_ids or "<any>",
                 )
             return None
-        if self._expected_client_id:
+        if self._expected_client_ids:
             cid = access.claims.get("cid") or access.claims.get("client_id")
-            if cid != self._expected_client_id:
+            if cid not in self._expected_client_ids:
                 logger.warning(
-                    "Rejecting token: cid claim %r does not match OKTA_CLIENT_ID",
-                    cid,
+                    "Rejecting token: cid claim %r is not in OKTA_CLIENT_IDS %s",
+                    cid, self._expected_client_ids,
                 )
                 return None
             # Surface cid as the canonical client_id on the AccessToken.
@@ -112,15 +116,17 @@ def build_okta_auth() -> OktaJWTVerifier | None:
         )
 
     jwks_uri = os.environ.get("OKTA_JWKS_URI") or f"{issuer.rstrip('/')}/v1/keys"
-    client_id = os.environ.get("OKTA_CLIENT_ID") or None
     base_url = os.environ.get("MCP_BASE_URL") or None
+
+    client_ids_raw = os.environ.get("OKTA_CLIENT_IDS", "").strip()
+    expected_client_ids = [c.strip() for c in client_ids_raw.split(",") if c.strip()] or None
 
     scopes_raw = os.environ.get("OKTA_REQUIRED_SCOPES", "").strip()
     required_scopes = [s.strip() for s in scopes_raw.split(",") if s.strip()] or None
 
     logger.info(
-        "Okta auth enabled (issuer=%s, audience=%s, client_id=%s, scopes=%s)",
-        issuer, audience, client_id or "<any>", required_scopes or "<none>",
+        "Okta auth enabled (issuer=%s, audience=%s, client_ids=%s, scopes=%s)",
+        issuer, audience, expected_client_ids or "<any>", required_scopes or "<none>",
     )
 
     return OktaJWTVerifier(
@@ -129,5 +135,5 @@ def build_okta_auth() -> OktaJWTVerifier | None:
         audience=audience,
         required_scopes=required_scopes,
         base_url=base_url,
-        expected_client_id=client_id,
+        expected_client_ids=expected_client_ids,
     )

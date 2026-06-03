@@ -15,8 +15,8 @@ services:
         sync: false                          # e.g. https://dev-123456.okta.com/oauth2/default
       - key: OKTA_AUDIENCE
         sync: false                          # e.g. api://default
-      - key: OKTA_CLIENT_ID
-        sync: false                          # optional: restrict to one Okta app
+      - key: OKTA_CLIENT_IDS
+        sync: false                          # optional: comma-separated list of allowed Okta apps
       - key: OKTA_DOMAIN
         sync: false                          # optional: e.g. dev-123456.okta.com
       - key: OKTA_JWKS_URI

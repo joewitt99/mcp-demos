@@ -283,7 +283,7 @@ cat >"$TASKDEF_FILE" <<JSON
       {"name": "MCP_LIST_PAGE_SIZE", "value": "${MCP_LIST_PAGE_SIZE:-30}"},
       {"name": "OKTA_ISSUER", "value": "$OKTA_ISSUER"},
       {"name": "OKTA_AUDIENCE", "value": "$OKTA_AUDIENCE"},
-      {"name": "OKTA_CLIENT_ID", "value": "${OKTA_CLIENT_ID:-}"},
+      {"name": "OKTA_CLIENT_IDS", "value": "${OKTA_CLIENT_IDS:-}"},
       {"name": "OKTA_DOMAIN", "value": "${OKTA_DOMAIN:-}"},
       {"name": "OKTA_REQUIRED_SCOPES", "value": "${OKTA_REQUIRED_SCOPES:-}"},
       {"name": "MCP_BASE_URL", "value": "https://${HOSTNAME}"}
