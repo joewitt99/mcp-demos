@@ -30,6 +30,12 @@ variable "new_vpc_cidr" {
   default     = "10.42.0.0/16"
 }
 
+variable "availability_zones" {
+  description = "AZs to use for the created subnets when create_vpc=true. Provide at least 2 (e.g. [\"us-east-1a\", \"us-east-1b\"]). If empty (default), Terraform calls DescribeAvailabilityZones to auto-pick — set this explicitly if your IAM role denies that call."
+  type        = list(string)
+  default     = []
+}
+
 variable "vpc_id" {
   description = "Existing VPC for ALB + tasks. Required when create_vpc=false."
   type        = string

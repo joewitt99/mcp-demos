@@ -15,8 +15,15 @@
 # and private subnets, or bring your own VPC and set create_vpc=false.
 ################################################################################
 
+locals {
+  # Only call DescribeAvailabilityZones when we actually need to (creating a
+  # VPC AND the operator didn't supply explicit AZ names). Some restricted
+  # deploy roles deny this read.
+  query_azs = var.create_vpc && length(var.availability_zones) == 0
+}
+
 data "aws_availability_zones" "available" {
-  count = var.create_vpc ? 1 : 0
+  count = local.query_azs ? 1 : 0
   state = "available"
 }
 
@@ -38,7 +45,7 @@ resource "aws_subnet" "public" {
   count                   = var.create_vpc ? 2 : 0
   vpc_id                  = aws_vpc.this[0].id
   cidr_block              = cidrsubnet(var.new_vpc_cidr, 4, count.index)
-  availability_zone       = data.aws_availability_zones.available[0].names[count.index]
+  availability_zone       = local.query_azs ? data.aws_availability_zones.available[0].names[count.index] : var.availability_zones[count.index]
   map_public_ip_on_launch = true
   tags                    = merge(local.tags, { Name = "${local.name}-public-${count.index}" })
 }

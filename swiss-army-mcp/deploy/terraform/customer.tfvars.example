@@ -12,8 +12,9 @@ hosted_zone_id = "Z..."
 # subnets in different AZs). Tasks run in the public subnets with public IPs;
 # no NAT, no extra cost. Comment out vpc_id / *_subnet_ids below in this mode.
 #
-# create_vpc    = true
-# new_vpc_cidr  = "10.42.0.0/16"
+# create_vpc          = true
+# new_vpc_cidr        = "10.42.0.0/16"
+# availability_zones  = ["us-east-1a", "us-east-1b"]   # required if your role denies ec2:DescribeAvailabilityZones
 
 # Option B: bring your own VPC. Required when create_vpc = false (default).
 vpc_id            = "vpc-..."
