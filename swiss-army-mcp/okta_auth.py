@@ -1,24 +1,21 @@
-"""Okta access-token verification for the FastMCP server.
+"""Okta JWT verification for the multi-tenant swiss-army-mcp.
 
-Validates the incoming `Authorization: Bearer <jwt>` header against an Okta
-custom authorization server using JWKS-based signature verification, plus
-issuer/audience/expiration checks. When OKTA_CLIENT_IDS is set, the token's
-`cid` claim must match one of the listed values — restricting access to a
-specific set of Okta apps.
+The single deployed instance serves many customers. Each request's bearer
+token is dispatched to the right verifier by inspecting its (unverified)
+``iss`` claim:
 
-Configuration (all via environment variables):
+  - Workload tokens (`/mcp/*`)  — `iss` is the customer's custom auth server.
+    Looked up against ``TenantStore.find_by_workload_issuer(iss)``.
+  - Admin tokens (`/config/workload` POST) — `iss` is the customer's org
+    auth server (their tenant URL). Looked up against
+    ``TenantStore.get(domain)`` via the host portion of `iss`.
 
-    OKTA_ISSUER         REQUIRED.  Full issuer URL of the custom auth server,
-                                   e.g. https://dev-123456.okta.com/oauth2/default
-    OKTA_AUDIENCE       REQUIRED.  Expected `aud` claim, e.g. api://default
-    OKTA_CLIENT_IDS     Optional.  Comma-separated list of allowed Okta app
-                                   client IDs. If set, the token's `cid` claim
-                                   must match one of them.
-    OKTA_JWKS_URI       Optional.  Defaults to {OKTA_ISSUER}/v1/keys
-    OKTA_REQUIRED_SCOPES  Optional. Comma-separated scopes the token must have.
-    OKTA_DOMAIN         Optional.  Informational, e.g. dev-123456.okta.com
-    MCP_BASE_URL        Optional.  Public URL of this MCP server (RFC 8707).
-    MCP_AUTH_DISABLED   Optional.  Set to 'true' to disable auth for local dev.
+For each tenant we lazily build and cache a per-tenant ``OktaJWTVerifier``
+holding the right JWKS URI, expected issuer/audience, and ``cid`` allow-list.
+
+Configuration (environment variables):
+    MCP_BASE_URL          Optional. Public URL of this MCP server.
+    MCP_AUTH_DISABLED     Optional. Set to 'true' to disable auth for local dev.
 """
 
 from __future__ import annotations
@@ -26,18 +23,23 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
+from urllib.parse import urlparse
 
-from fastmcp.server.auth.providers.jwt import AccessToken, JWTVerifier
+from fastmcp.server.auth.providers.jwt import (
+    AccessToken,
+    JWTVerifier,
+    TokenVerifier,
+)
+
+from tenant_config import Tenant, TenantStore
 
 logger = logging.getLogger(__name__)
 
 
-def _peek_jwt_claims(token: str) -> dict | None:
-    """Decode a JWT's payload WITHOUT verifying its signature.
+def peek_jwt_claims(token: str) -> dict | None:
+    """Decode a JWT payload WITHOUT verifying its signature.
 
-    Diagnostic-only — used to surface why a token was rejected (e.g. wrong
-    audience, expired, wrong issuer). Never trust these claims for auth.
+    Diagnostic-only — never trust these claims for auth decisions.
     """
     try:
         _, payload_b64, _ = token.split(".", 2)
@@ -48,14 +50,7 @@ def _peek_jwt_claims(token: str) -> dict | None:
 
 
 class OktaJWTVerifier(JWTVerifier):
-    """JWTVerifier with an additional Okta-specific `cid` claim check.
-
-    Okta access tokens identify the calling app via the `cid` claim (not the
-    standard OAuth `client_id`). The base verifier already validates the
-    signature, issuer, audience, and expiration; this subclass adds an
-    optional allow-list check on `cid` so the server can be locked to one or
-    more specific Okta apps.
-    """
+    """JWTVerifier with an additional Okta-specific `cid` claim allow-list."""
 
     def __init__(self, *, expected_client_ids: list[str] | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -64,7 +59,7 @@ class OktaJWTVerifier(JWTVerifier):
     async def verify_token(self, token: str) -> AccessToken | None:
         access = await super().verify_token(token)
         if access is None:
-            peek = _peek_jwt_claims(token)
+            peek = peek_jwt_claims(token)
             if peek is None:
                 logger.warning("Token rejected and is not a parseable JWT.")
             else:
@@ -83,57 +78,92 @@ class OktaJWTVerifier(JWTVerifier):
             cid = access.claims.get("cid") or access.claims.get("client_id")
             if cid not in self._expected_client_ids:
                 logger.warning(
-                    "Rejecting token: cid claim %r is not in OKTA_CLIENT_IDS %s",
+                    "Rejecting token: cid claim %r is not in allow-list %s",
                     cid, self._expected_client_ids,
                 )
                 return None
-            # Surface cid as the canonical client_id on the AccessToken.
             access.client_id = str(cid)
-        logger.info(
-            "Token verified. Claims: %s",
-            json.dumps(access.claims, default=str, sort_keys=True),
-        )
         return access
 
 
-def build_okta_auth() -> OktaJWTVerifier | None:
-    """Construct an Okta JWT verifier from environment variables.
-
-    Returns None if MCP_AUTH_DISABLED=true (useful for local development).
-    Raises RuntimeError if required env vars are missing.
-    """
-    if os.environ.get("MCP_AUTH_DISABLED", "").lower() == "true":
-        logger.warning("MCP_AUTH_DISABLED=true — Okta auth is OFF. Do not use in prod.")
-        return None
-
-    issuer = os.environ.get("OKTA_ISSUER")
-    audience = os.environ.get("OKTA_AUDIENCE")
-    missing = [k for k, v in {"OKTA_ISSUER": issuer, "OKTA_AUDIENCE": audience}.items() if not v]
-    if missing:
-        raise RuntimeError(
-            f"Missing required Okta env vars: {', '.join(missing)}. "
-            "Set MCP_AUTH_DISABLED=true to disable auth for local development."
-        )
-
-    jwks_uri = os.environ.get("OKTA_JWKS_URI") or f"{issuer.rstrip('/')}/v1/keys"
-    base_url = os.environ.get("MCP_BASE_URL") or None
-
-    client_ids_raw = os.environ.get("OKTA_CLIENT_IDS", "").strip()
-    expected_client_ids = [c.strip() for c in client_ids_raw.split(",") if c.strip()] or None
-
-    scopes_raw = os.environ.get("OKTA_REQUIRED_SCOPES", "").strip()
-    required_scopes = [s.strip() for s in scopes_raw.split(",") if s.strip()] or None
-
-    logger.info(
-        "Okta auth enabled (issuer=%s, audience=%s, client_ids=%s, scopes=%s)",
-        issuer, audience, expected_client_ids or "<any>", required_scopes or "<none>",
-    )
-
+def build_workload_verifier(tenant: Tenant, base_url: str | None) -> OktaJWTVerifier:
+    if not tenant.custom_issuer or not tenant.audience:
+        raise ValueError(f"Tenant {tenant.okta_domain} has no workload config yet")
     return OktaJWTVerifier(
-        jwks_uri=jwks_uri,
-        issuer=issuer,
-        audience=audience,
-        required_scopes=required_scopes,
+        jwks_uri=f"{tenant.custom_issuer.rstrip('/')}/v1/keys",
+        issuer=tenant.custom_issuer,
+        audience=tenant.audience,
         base_url=base_url,
-        expected_client_ids=expected_client_ids,
+        expected_client_ids=tenant.workload_client_ids or None,
     )
+
+
+def build_admin_verifier(tenant: Tenant) -> OktaJWTVerifier:
+    """Verifier for an admin SPA token issued by the tenant's org auth server."""
+    issuer = tenant.org_issuer
+    return OktaJWTVerifier(
+        jwks_uri=f"{issuer.rstrip('/')}/oauth2/v1/keys",
+        issuer=issuer,
+        audience=issuer,
+        expected_client_ids=[tenant.admin_client_id],
+    )
+
+
+class MultiTenantOktaVerifier(TokenVerifier):
+    """FastMCP auth provider for workload tokens across many tenants.
+
+    Looks up the tenant by the token's (unverified) ``iss`` claim, then
+    delegates to a per-tenant ``OktaJWTVerifier`` that performs the real
+    signature + claims verification.
+    """
+
+    def __init__(self, *, store: TenantStore, base_url: str | None = None):
+        super().__init__(base_url=base_url)
+        self._store = store
+        self._base_url = base_url
+        self._verifiers: dict[str, OktaJWTVerifier] = {}  # by custom_issuer
+        # FastMCP metadata endpoints expect these to exist.
+        self.issuer = None
+        self.audience = None
+
+    def invalidate(self, custom_issuer: str | None) -> None:
+        """Drop any cached verifier for ``custom_issuer`` so the next request
+        rebuilds it from the (possibly updated) tenant config."""
+        if custom_issuer and custom_issuer in self._verifiers:
+            del self._verifiers[custom_issuer]
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        peek = peek_jwt_claims(token)
+        if not peek:
+            logger.warning("Workload token rejected: not a parseable JWT")
+            return None
+        iss = peek.get("iss")
+        if not iss:
+            logger.warning("Workload token rejected: no iss claim")
+            return None
+        tenant = self._store.find_by_workload_issuer(iss)
+        if tenant is None:
+            logger.warning(
+                "Workload token rejected: no tenant matches iss=%s. "
+                "Configured tenants: %s",
+                iss, [t.custom_issuer for t in self._store.all() if t.custom_issuer],
+            )
+            return None
+        verifier = self._verifiers.get(iss)
+        if verifier is None:
+            verifier = build_workload_verifier(tenant, self._base_url)
+            self._verifiers[iss] = verifier
+        return await verifier.verify_token(token)
+
+
+def domain_from_issuer(iss: str) -> str | None:
+    """Extract the Okta domain from an issuer URL.
+
+    For org auth servers `iss` looks like ``https://<tenant>.okta.com``, so
+    the domain is the URL host. For custom auth servers it's the same.
+    """
+    try:
+        host = urlparse(iss).netloc
+        return host.lower() or None
+    except Exception:
+        return None

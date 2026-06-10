@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY server.py okta_auth.py ./
+COPY server.py okta_auth.py tenant_config.py config_routes.py scopes.py ./
 
 EXPOSE 8000
 ENV PORT=8000

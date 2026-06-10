@@ -35,13 +35,31 @@ from html import unescape as html_unescape_fn
 
 from fastmcp import FastMCP
 
-from okta_auth import build_okta_auth
+from config_routes import register_config_routes
+from okta_auth import MultiTenantOktaVerifier
+from scopes import ScopeMiddleware
+from tenant_config import TenantStore
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 # MCP-spec cursor pagination for list operations (tools/resources/prompts).
 # Clients send an opaque `cursor`; responses include `nextCursor` until exhausted.
 LIST_PAGE_SIZE = int(os.environ.get("MCP_LIST_PAGE_SIZE", "30"))
+
+# This is the single shared instance; each request's tenant is identified by
+# the bearer token's `iss` claim and dispatched to a per-tenant verifier.
+_PUBLIC_BASE_URL = os.environ.get("MCP_BASE_URL") or None
+_AUTH_DISABLED = os.environ.get("MCP_AUTH_DISABLED", "").lower() == "true"
+if _AUTH_DISABLED:
+    logging.warning("MCP_AUTH_DISABLED=true — Okta auth is OFF. Do not use in prod.")
+
+_store: TenantStore | None = None if _AUTH_DISABLED else TenantStore()
+_workload_verifier: MultiTenantOktaVerifier | None = (
+    None if _store is None
+    else MultiTenantOktaVerifier(store=_store, base_url=_PUBLIC_BASE_URL)
+)
+
+_middleware = [ScopeMiddleware(_store)] if _store is not None else []
 
 mcp = FastMCP(
     name="swiss-army-mcp",
@@ -51,7 +69,8 @@ mcp = FastMCP(
         "unit_, data_, fun_. tools/list is paginated; follow nextCursor to "
         "retrieve all 100 tools."
     ),
-    auth=build_okta_auth(),
+    auth=_workload_verifier,
+    middleware=_middleware,
     list_page_size=LIST_PAGE_SIZE,
 )
 
@@ -921,6 +940,25 @@ def fun_emoji_clock(iso_time: str | None = None) -> str:
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
+
+    if not _AUTH_DISABLED:
+        # Load every tenant under MCP_TENANTS_PREFIX from SSM so workload
+        # tokens can be dispatched right away. New tenants register through
+        # /config and live in the same caches without a restart.
+        assert _store is not None and _workload_verifier is not None
+        _store.hydrate()
+        if not _store.all():
+            logging.warning(
+                "No tenants found in SSM. Workload traffic will be rejected "
+                "until at least one tenant completes setup at /config."
+            )
+        register_config_routes(
+            mcp,
+            store=_store,
+            workload_verifier=_workload_verifier,
+            public_base_url=_PUBLIC_BASE_URL,
+        )
+
     # Stateful HTTP (default): server issues an Mcp-Session-Id on initialize
     # and returns 404 for requests carrying an unknown session ID, per the
     # MCP Streamable HTTP spec. Useful for exercising client-side recovery.

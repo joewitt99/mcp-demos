@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and fill in. One shared instance, not per-customer.
+
+aws_region = "us-east-1"
+
+# ---- DNS + TLS (existing) ----
+hostname       = "swiss-army-mcp.bridge.oktaproserv.com"
+cert_arn       = "arn:aws:acm:us-east-1:<account>:certificate/<id>"
+hosted_zone_id = "Z..."
+
+# ---- VPC (existing) ----
+vpc_id            = "vpc-..."
+public_subnet_ids = ["subnet-aaa", "subnet-bbb"]
+task_subnet_ids   = ["subnet-aaa", "subnet-bbb"]
+assign_public_ip  = true   # true when task_subnet_ids are public (no NAT)
+
+# ---- Image ----
+image_tag = "0.5.0"
+
+# ---- SSM tenants prefix (default is fine for most setups) ----
+# tenants_prefix = "/swiss-army-mcp/tenants/"
