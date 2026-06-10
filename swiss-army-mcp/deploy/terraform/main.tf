@@ -74,9 +74,14 @@ resource "aws_iam_role_policy" "task_ssm" {
         Resource = local.ssm_tenants_arn
       },
       {
-        Effect   = "Allow",
-        Action   = ["ssm:GetParametersByPath"],
-        Resource = local.ssm_prefix_arn
+        Effect = "Allow",
+        Action = ["ssm:GetParametersByPath"],
+        # AWS evaluates the path with and without trailing slash depending on
+        # how the caller normalized it; grant both forms.
+        Resource = [
+          local.ssm_prefix_arn,
+          "${local.ssm_prefix_arn}/"
+        ]
       }
     ]
   })
