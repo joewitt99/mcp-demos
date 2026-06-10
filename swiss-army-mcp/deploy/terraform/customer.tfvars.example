@@ -7,7 +7,15 @@ hostname       = "swiss-army-mcp.bridge.oktaproserv.com"
 cert_arn       = "arn:aws:acm:us-east-1:<account>:certificate/<id>"
 hosted_zone_id = "Z..."
 
-# ---- VPC (existing) ----
+# ---- VPC ----
+# Option A: let Terraform create a minimal demo VPC (1 VPC, IGW, 2 public
+# subnets in different AZs). Tasks run in the public subnets with public IPs;
+# no NAT, no extra cost. Comment out vpc_id / *_subnet_ids below in this mode.
+#
+# create_vpc    = true
+# new_vpc_cidr  = "10.42.0.0/16"
+
+# Option B: bring your own VPC. Required when create_vpc = false (default).
 vpc_id            = "vpc-..."
 public_subnet_ids = ["subnet-aaa", "subnet-bbb"]
 task_subnet_ids   = ["subnet-aaa", "subnet-bbb"]

@@ -27,3 +27,13 @@ output "log_group" {
   description = "CloudWatch log group for the task."
   value       = aws_cloudwatch_log_group.this.name
 }
+
+output "vpc_id" {
+  description = "VPC ID actually in use (created or bring-your-own)."
+  value       = local.effective_vpc_id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs actually in use."
+  value       = local.effective_public_subnets
+}

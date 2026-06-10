@@ -22,7 +22,14 @@ aws ssm get-parameters-by-path --path /swiss-army-mcp/tenants/ --query 'Paramete
   xargs -n1 aws ssm delete-parameter --name
 ```
 
-Bring your own: VPC + subnets, ACM cert (same region), Route 53 hosted zone.
+Bring your own: ACM cert (same region) and Route 53 hosted zone.
+
+**VPC: bring your own or let Terraform create one.**
+
+| Mode | Set in tfvars | Notes |
+| --- | --- | --- |
+| BYO VPC | `create_vpc = false` (default) + `vpc_id`, `public_subnet_ids`, `task_subnet_ids` | Use existing networking. Set `assign_public_ip = true` if task subnets are public and have no NAT. |
+| Terraform creates | `create_vpc = true` (+ optional `new_vpc_cidr`) | Minimal demo VPC: 1 VPC, IGW, 2 public /20 subnets in different AZs, default route. Tasks run in the public subnets with public IPs (no NAT, no extra cost). The BYO vars are ignored. |
 
 ## Running from EC2
 

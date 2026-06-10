@@ -10,6 +10,13 @@ locals {
   ssm_tenants_arn = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.ssm_path_no_slash}/*"
   # ARN for the path itself (used by GetParametersByPath at hydrate time).
   ssm_prefix_arn = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.ssm_path_no_slash}"
+
+  # Effective network values — created VPC takes precedence over inputs.
+  effective_vpc_id           = var.create_vpc ? aws_vpc.this[0].id : var.vpc_id
+  effective_public_subnets   = var.create_vpc ? aws_subnet.public[*].id : var.public_subnet_ids
+  effective_task_subnets     = var.create_vpc ? aws_subnet.public[*].id : var.task_subnet_ids
+  effective_assign_public_ip = var.create_vpc ? true : var.assign_public_ip
+
   tags = {
     project = "swiss-army-mcp"
     managed = "terraform"
@@ -81,7 +88,7 @@ resource "aws_iam_role_policy" "task_ssm" {
 resource "aws_security_group" "alb" {
   name        = "${local.name}-alb-sg"
   description = "Ingress to ${local.name} ALB"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.effective_vpc_id
   tags        = local.tags
 }
 
@@ -102,7 +109,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_egress" {
 resource "aws_security_group" "task" {
   name        = "${local.name}-task-sg"
   description = "${local.name} Fargate tasks"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.effective_vpc_id
   tags        = local.tags
 }
 
@@ -127,7 +134,7 @@ resource "aws_lb" "this" {
   name               = "${local.name}-alb"
   load_balancer_type = "application"
   internal           = false
-  subnets            = var.public_subnet_ids
+  subnets            = local.effective_public_subnets
   security_groups    = [aws_security_group.alb.id]
   tags               = local.tags
 }
@@ -137,7 +144,7 @@ resource "aws_lb_target_group" "this" {
   port        = local.container_port
   protocol    = "HTTP"
   target_type = "ip"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.effective_vpc_id
 
   health_check {
     protocol            = "HTTP"
@@ -246,9 +253,9 @@ resource "aws_ecs_service" "this" {
   health_check_grace_period_seconds = 60
 
   network_configuration {
-    subnets          = var.task_subnet_ids
+    subnets          = local.effective_task_subnets
     security_groups  = [aws_security_group.task.id]
-    assign_public_ip = var.assign_public_ip
+    assign_public_ip = local.effective_assign_public_ip
   }
 
   load_balancer {

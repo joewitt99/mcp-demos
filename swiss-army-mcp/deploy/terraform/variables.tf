@@ -18,23 +18,38 @@ variable "hosted_zone_id" {
   type        = string
 }
 
-variable "vpc_id" {
-  description = "Existing VPC for ALB + tasks."
+variable "create_vpc" {
+  description = "When true, Terraform provisions a minimal demo VPC (IGW + 2 public subnets) and ignores vpc_id/public_subnet_ids/task_subnet_ids. When false, those three are required."
+  type        = bool
+  default     = false
+}
+
+variable "new_vpc_cidr" {
+  description = "CIDR block to use when create_vpc=true. Subnets are carved as /20s in the first two available AZs."
   type        = string
+  default     = "10.42.0.0/16"
+}
+
+variable "vpc_id" {
+  description = "Existing VPC for ALB + tasks. Required when create_vpc=false."
+  type        = string
+  default     = null
 }
 
 variable "public_subnet_ids" {
-  description = "Public subnets (2+ AZs) for the ALB."
+  description = "Public subnets (2+ AZs) for the ALB. Required when create_vpc=false."
   type        = list(string)
+  default     = []
 }
 
 variable "task_subnet_ids" {
-  description = "Subnets where Fargate tasks run. Use private+NAT for prod, or the public subnets with assign_public_ip=true."
+  description = "Subnets where Fargate tasks run. Use private+NAT for prod, or the public subnets with assign_public_ip=true. Required when create_vpc=false."
   type        = list(string)
+  default     = []
 }
 
 variable "assign_public_ip" {
-  description = "Whether tasks get a public IP. Set true only when task_subnet_ids are public subnets without NAT."
+  description = "Whether tasks get a public IP. Ignored when create_vpc=true (forced to true since the created VPC has no NAT). Set true for bring-your-own public subnets without NAT."
   type        = bool
   default     = false
 }
