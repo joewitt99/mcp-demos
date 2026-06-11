@@ -63,7 +63,7 @@ variable "assign_public_ip" {
 variable "image_tag" {
   description = "Tag of the joewitt99/swiss-army-mcp image to deploy. Pin a version for stability."
   type        = string
-  default     = "0.5.2"
+  default     = "0.5.3"
 }
 
 variable "tenants_prefix" {

@@ -30,6 +30,7 @@ from okta_auth import (
     domain_from_issuer,
     peek_jwt_claims,
 )
+from scopes import TOOL_PREFIX_TO_SCOPE, WILDCARD_SCOPE
 from tenant_config import Tenant, TenantStore
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,11 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 
 def _html(redirect_uri: str) -> str:
+    scope_rows = "\n          ".join(
+        f"<tr><td><code>{prefix}*</code></td><td><code>{scope}</code></td></tr>"
+        for prefix, scope in TOOL_PREFIX_TO_SCOPE.items()
+    )
+    wildcard_scope = WILDCARD_SCOPE
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -74,6 +80,13 @@ def _html(redirect_uri: str) -> str:
     .redirect-box {{ display: flex; gap: 0.5rem; align-items: center; }}
     .redirect-box code {{ flex: 1; padding: 0.5rem 0.75rem; word-break: break-all; }}
     .copy-btn {{ margin: 0; padding: 0.4rem 0.8rem; font-size: 0.85em; }}
+    details.scope-ref {{ margin: 0.5rem 0 0; font-size: 0.85rem; }}
+    details.scope-ref summary {{ cursor: pointer; color: #0a66c2; user-select: none; }}
+    details.scope-ref summary:hover {{ text-decoration: underline; }}
+    details.scope-ref p {{ color: #555; margin: 0.6rem 0 0.4rem; }}
+    details.scope-ref table {{ width: 100%; border-collapse: collapse; margin-top: 0.25rem; }}
+    details.scope-ref th, details.scope-ref td {{ padding: 0.3rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }}
+    details.scope-ref th {{ font-weight: 600; color: #444; background: #fafafa; }}
   </style>
 </head>
 <body>
@@ -139,8 +152,27 @@ def _html(redirect_uri: str) -> str:
 
     <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 1.25rem;">
       <input id="enforce" type="checkbox" style="width: auto;">
-      Enforce per-category scopes
+      Restrict tool access by scope
     </label>
+    <div class="hint" style="margin-top: 0.4rem;">
+      <strong>Off (default):</strong> any valid token can call every tool.
+      <strong>On:</strong> each tool requires a specific scope in the token's
+      <code>scp</code> claim — calls without it are denied and the tool is
+      hidden from <code>tools/list</code>.
+    </div>
+    <details class="scope-ref">
+      <summary>Show scope reference</summary>
+      <p>Define these scopes on your Okta custom authorization server and
+         grant them to your workload client. The wildcard
+         <code>{wildcard_scope}</code> covers every category.</p>
+      <table>
+        <thead><tr><th>Tool prefix</th><th>Required scope</th></tr></thead>
+        <tbody>
+          {scope_rows}
+          <tr><td><code>(any)</code></td><td><code>{wildcard_scope}</code></td></tr>
+        </tbody>
+      </table>
+    </details>
 
     <button id="save-btn" type="submit">Save configuration</button>
     <button id="signout-btn" class="secondary" type="button">Sign out</button>
