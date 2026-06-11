@@ -23,7 +23,7 @@ task_subnet_ids   = ["subnet-aaa", "subnet-bbb"]
 assign_public_ip  = true   # true when task_subnet_ids are public (no NAT)
 
 # ---- Image ----
-image_tag = "0.5.4"
+image_tag = "0.5.5"
 
 # ---- SSM tenants prefix (default is fine for most setups) ----
 # tenants_prefix = "/swiss-army-mcp/tenants/"
