@@ -34,6 +34,8 @@ from html import escape as html_escape_fn
 from html import unescape as html_unescape_fn
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 from config_routes import register_config_routes
 from okta_auth import MultiTenantOktaVerifier
@@ -73,6 +75,15 @@ mcp = FastMCP(
     middleware=_middleware,
     list_page_size=LIST_PAGE_SIZE,
 )
+
+
+# Unauthenticated liveness probe for the ALB. /mcp itself correctly returns
+# 401 + WWW-Authenticate for unauthenticated callers per the MCP spec, so it
+# is not a suitable health-check target — hitting it spams 401s into the logs
+# and makes target health ambiguous.
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(_request: Request) -> PlainTextResponse:
+    return PlainTextResponse("ok")
 
 
 # ============================================================================

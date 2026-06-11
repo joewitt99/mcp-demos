@@ -153,8 +153,8 @@ resource "aws_lb_target_group" "this" {
 
   health_check {
     protocol            = "HTTP"
-    path                = "/mcp"
-    matcher             = "200-499"
+    path                = "/healthz"
+    matcher             = "200"
     interval            = 30
     timeout             = 5
     healthy_threshold   = 2
