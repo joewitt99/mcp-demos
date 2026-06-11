@@ -100,7 +100,7 @@ def _html(redirect_uri: str) -> str:
   <!-- Step 1: domain entry -->
   <form id="domain-form" class="hidden">
     <div class="callout">
-      <div style="margin-bottom: 0.5rem;">Before you continue: add this URI to your Bridge demo Admin UI application in Okta as <strong>both</strong> a <em>Sign-in redirect URI</em> and a <em>Sign-out redirect URI</em>.</div>
+      <div style="margin-bottom: 0.5rem;">Before you continue:  you need to add this redirect uri to your Bridge demo Admin UI application in Okta.</div>
       <div class="redirect-box">
         <code id="redirect-uri-display"></code>
         <button type="button" class="copy-btn secondary" id="copy-btn">Copy</button>
@@ -253,7 +253,6 @@ async function finishLogin(code, state) {{
   if (!r.ok) throw new Error('token exchange failed: ' + await r.text());
   const tok = await r.json();
   SS.setItem('access_token', tok.access_token);
-  if (tok.id_token) SS.setItem('id_token', tok.id_token);
   SS.removeItem('pkce_verifier');
   SS.removeItem('pkce_state');
   window.history.replaceState({{}}, '', '/config');
@@ -312,20 +311,7 @@ async function saveWorkload(ev) {{
 }}
 
 function signOut() {{
-  const idToken = SS.getItem('id_token');
-  const domain  = SS.getItem('domain');
   SS.clear();
-  // RP-initiated logout (OIDC) — ends the Okta session so the next login is
-  // a fresh prompt instead of silent SSO. Falls back to a local-only redirect
-  // if there is no id_token (e.g. a stale session from before this build).
-  if (idToken && domain) {{
-    const params = new URLSearchParams({{
-      id_token_hint: idToken,
-      post_logout_redirect_uri: window.location.origin + '/config/callback',
-    }});
-    window.location.href = 'https://' + domain + '/oauth2/v1/logout?' + params.toString();
-    return;
-  }}
   window.location.href = '/config';
 }}
 
