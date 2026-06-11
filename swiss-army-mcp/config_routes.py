@@ -100,7 +100,7 @@ def _html(redirect_uri: str) -> str:
   <!-- Step 1: domain entry -->
   <form id="domain-form" class="hidden">
     <div class="callout">
-      <div style="margin-bottom: 0.5rem;">Before you continue: add this redirect URI to your admin Okta SPA.</div>
+      <div style="margin-bottom: 0.5rem;">Before you continue:  you need to add this redirect uri to your Bridge demo Admin UI application in Okta.</div>
       <div class="redirect-box">
         <code id="redirect-uri-display"></code>
         <button type="button" class="copy-btn secondary" id="copy-btn">Copy</button>
