@@ -1,7 +1,7 @@
 """Multi-tenant config persistence for swiss-army-mcp.
 
 A single deployed instance serves many customers. Each customer is identified
-by their Okta org domain (e.g. ``joe-wf-oie-demos.oktapreview.com``) and self-
+by their Okta org domain (e.g. ``your-tenant.oktapreview.com``) and self-
 onboards via the ``/config`` UI. Their settings are persisted to AWS SSM
 Parameter Store at ``/swiss-army-mcp/tenants/<domain>``.
 

@@ -12,7 +12,7 @@ One shared deployment serves many customers. Each customer self-onboards
 through a public `/config` page (clearly banner'd as a demo environment):
 
 1. The page displays the redirect URI to register on their admin Okta SPA.
-2. They enter their Okta domain (e.g. `joe-wf-oie-demos.oktapreview.com`)
+2. They enter their Okta domain (e.g. `your-tenant.oktapreview.com`)
    and click **Next**.
 3. If the domain is already registered, they're sent straight to login.
    Otherwise they enter their admin SPA `client_id` and click

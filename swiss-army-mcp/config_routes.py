@@ -98,7 +98,7 @@ def _html(redirect_uri: str) -> str:
     <input id="domain" type="text" required
            placeholder="your-tenant.okta.com" autocomplete="off">
     <div class="hint">No <code>https://</code>, no paths. Example:
-      <code>joe-wf-oie-demos.oktapreview.com</code>.</div>
+      <code>your-tenant.oktapreview.com</code>.</div>
 
     <button id="next-btn" type="submit">Next</button>
     <div id="domain-msg" class="msg hidden"></div>

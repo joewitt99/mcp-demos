@@ -65,7 +65,7 @@ and log group. Tenant configs in SSM are preserved (see above).
 
 Each customer visits `https://<your-host>/config` and self-onboards:
 
-1. Enter their Okta domain (e.g. `joe-wf-oie-demos.oktapreview.com`).
+1. Enter their Okta domain (e.g. `your-tenant.oktapreview.com`).
 2. Enter their admin SPA `client_id`.
 3. Add the displayed redirect URI to that Okta SPA.
 4. Click Login → completes PKCE against the org auth server.
