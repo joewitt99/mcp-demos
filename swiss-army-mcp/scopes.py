@@ -9,6 +9,10 @@ A wildcard scope grants access to every category — useful for admin testing.
 Enforcement is toggled by the tenant config's `enforce_scopes` flag (set via
 the /admin UI). When disabled, the middleware is a no-op so customers can
 bring up the server before their auth server is fully scope-aware.
+
+tools/list is intentionally NOT filtered by scope: the LLM should always
+see all 100 tools so demos can show the server rejecting a call to a tool
+the caller doesn't have a scope for.
 """
 
 from __future__ import annotations
@@ -59,12 +63,15 @@ def _token_has_scope(token, scope: str) -> bool:
 
 
 class ScopeMiddleware(Middleware):
-    """Enforce per-category scopes on tool calls; filter unauthorized tools out
-    of tools/list.
+    """Enforce per-category scopes on tool calls.
 
     Multi-tenant: the request's token tells us which tenant's `enforce_scopes`
     flag to consult. If the token can't be mapped to a tenant (or the tenant
     has scope enforcement off), the middleware is a no-op.
+
+    tools/list is left untouched on purpose — the LLM should see every tool so
+    that demos can show the server rejecting calls to tools the caller is not
+    authorized to use.
     """
 
     def __init__(self, store: TenantStore):
@@ -98,12 +105,3 @@ class ScopeMiddleware(Middleware):
             )
         return await call_next(context)
 
-    async def on_list_tools(self, context: MiddlewareContext, call_next: CallNext):
-        tools = await call_next(context)
-        if not self._enforcement_for_current_token():
-            return tools
-        token = get_access_token()
-        return [
-            t for t in tools
-            if (scope := required_scope(t.name)) is None or _token_has_scope(token, scope)
-        ]

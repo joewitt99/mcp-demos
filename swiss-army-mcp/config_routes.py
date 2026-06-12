@@ -157,8 +157,9 @@ def _html(redirect_uri: str) -> str:
     <div class="hint" style="margin-top: 0.4rem;">
       <strong>Off (default):</strong> any valid token can call every tool.
       <strong>On:</strong> each tool requires a specific scope in the token's
-      <code>scp</code> claim — calls without it are denied and the tool is
-      hidden from <code>tools/list</code>.
+      <code>scp</code> claim — calls without it are denied at invocation time.
+      <code>tools/list</code> still returns every tool either way so the LLM
+      can attempt unauthorized calls and observe the rejection.
     </div>
     <details class="scope-ref">
       <summary>Show scope reference</summary>
