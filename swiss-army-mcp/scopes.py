@@ -81,7 +81,13 @@ class ScopeMiddleware(Middleware):
         token = get_access_token()
         if token is None or not getattr(token, "claims", None):
             return False
-        tenant = self._store.find_by_workload_issuer(token.claims.get("iss") or "")
+        # Opaque tokens minted from an ID-JAG carry the tenant domain directly;
+        # Okta workload JWTs are resolved by their custom-auth-server issuer.
+        domain = token.claims.get("tenant_domain")
+        if domain:
+            tenant = self._store.get(domain)
+        else:
+            tenant = self._store.find_by_workload_issuer(token.claims.get("iss") or "")
         return bool(tenant and tenant.enforce_scopes)
 
     async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext):

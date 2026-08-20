@@ -86,25 +86,59 @@ class OktaJWTVerifier(JWTVerifier):
         return access
 
 
+def okta_jwks_uri(issuer: str) -> str:
+    """Derive the Okta JWKS URI for an issuer.
+
+    Custom authorization servers have an ``/oauth2/<ausId>`` path and serve keys
+    at ``{issuer}/v1/keys``. A bare org auth server (``https://<domain>``) serves
+    keys at ``{issuer}/oauth2/v1/keys``. This is the single place that knows the
+    Okta JWKS URL conventions.
+    """
+    trimmed = issuer.rstrip("/")
+    if "/oauth2/" in trimmed:
+        return f"{trimmed}/v1/keys"
+    return f"{trimmed}/oauth2/v1/keys"
+
+
+def build_issuer_verifier(
+    issuer: str,
+    audience: str,
+    *,
+    expected_client_ids: list[str] | None = None,
+    base_url: str | None = None,
+) -> OktaJWTVerifier:
+    """Build an ``OktaJWTVerifier`` for tokens signed by ``issuer``.
+
+    Validates signature (against the issuer's JWKS), ``iss``, ``aud``, and
+    ``exp``. Used both for Okta workload/admin tokens and for verifying the
+    signature of an inbound ID-JAG assertion.
+    """
+    return OktaJWTVerifier(
+        jwks_uri=okta_jwks_uri(issuer),
+        issuer=issuer,
+        audience=audience,
+        base_url=base_url,
+        expected_client_ids=expected_client_ids,
+    )
+
+
 def build_workload_verifier(tenant: Tenant, base_url: str | None) -> OktaJWTVerifier:
     if not tenant.custom_issuer or not tenant.audience:
         raise ValueError(f"Tenant {tenant.okta_domain} has no workload config yet")
-    return OktaJWTVerifier(
-        jwks_uri=f"{tenant.custom_issuer.rstrip('/')}/v1/keys",
-        issuer=tenant.custom_issuer,
-        audience=tenant.audience,
-        base_url=base_url,
+    return build_issuer_verifier(
+        tenant.custom_issuer,
+        tenant.audience,
         expected_client_ids=tenant.workload_client_ids or None,
+        base_url=base_url,
     )
 
 
 def build_admin_verifier(tenant: Tenant) -> OktaJWTVerifier:
     """Verifier for an admin SPA token issued by the tenant's org auth server."""
     issuer = tenant.org_issuer
-    return OktaJWTVerifier(
-        jwks_uri=f"{issuer.rstrip('/')}/oauth2/v1/keys",
-        issuer=issuer,
-        audience=issuer,
+    return build_issuer_verifier(
+        issuer,
+        issuer,
         expected_client_ids=[tenant.admin_client_id],
     )
 

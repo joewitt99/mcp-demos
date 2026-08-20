@@ -3,7 +3,7 @@
 A demo [Model Context Protocol](https://modelcontextprotocol.io) server exposing **100 tools across 10 categories** — text, math, encoding, hashing, date/time, random, color, units, data, and fun. Useful for exercising MCP clients against a non-trivial tool surface, including paginated `tools/list` and Okta-backed OAuth.
 
 - **Transport:** Streamable HTTP (stateful — issues `Mcp-Session-Id` on `initialize`)
-- **Auth:** Okta JWT, multi-tenant — customers self-onboard at `/config`. Per-tenant settings persist to AWS SSM.
+- **Auth:** Two paths — (1) direct Okta JWT access tokens, and (2) **ID-JAG / Cross-App-Access**: the server acts as a Resource Authorization Server, redeeming an ID-JAG at `/token` for an opaque access token it mints itself. Multi-tenant — customers self-onboard at `/config`. Per-tenant settings persist to AWS SSM.
 - **Image:** [`joewitt99/swiss-army-mcp`](https://hub.docker.com/r/joewitt99/swiss-army-mcp) — `linux/amd64`, `linux/arm64`
 
 ## How it works
@@ -57,7 +57,9 @@ configure themselves via `/config`).
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `MCP_BASE_URL` | yes | Public URL of this server. Used to build the `/config/callback` redirect URI. |
+| `MCP_BASE_URL` | yes | Public URL of this server. Used to build the `/config/callback` redirect URI, the protected-resource metadata, and (by default) the OAuth issuer. |
+| `MCP_ISSUER` | no | OAuth issuer identifier for the ID-JAG flow. Customers set this as the ID-JAG `aud` in Okta. Defaults to `MCP_BASE_URL`. |
+| `MCP_OPAQUE_TOKEN_TTL` | no | Lifetime (seconds) of opaque access tokens minted at `/token` (default `3600`). |
 | `MCP_TENANTS_PREFIX` | no | SSM prefix for per-tenant configs (default `/swiss-army-mcp/tenants/`). |
 | `AWS_REGION` | no | Region for the SSM client (default `us-east-1`). |
 | `MCP_AUTH_DISABLED` | no | Set to `true` to bypass Okta entirely. **Local demos only.** |
@@ -68,7 +70,45 @@ configure themselves via `/config`).
 
 Per-tenant runtime config (set via `/config`): **okta_domain**,
 **admin_client_id**, **custom_issuer**, **audience**, **workload_client_ids**,
-**enforce_scopes**.
+**enforce_scopes**, **idjag_issuer**.
+
+## ID-JAG / Cross-App-Access
+
+Besides accepting Okta access tokens directly, this server can act as a
+**Resource Authorization Server** in the ID-JAG (Identity Assertion JWT
+Authorization Grant / Okta Cross-App-Access) flow
+([draft-ietf-oauth-identity-assertion-authz-grant](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-identity-assertion-authz-grant)):
+
+1. A requesting app obtains an **ID-JAG** from the customer's Okta org (the IdP)
+   via RFC 8693 token exchange, with `aud` set to this server's issuer
+   (`MCP_ISSUER`).
+2. The app POSTs the ID-JAG to `POST /token` using the RFC 7523
+   `urn:ietf:params:oauth:grant-type:jwt-bearer` grant.
+3. The server validates the ID-JAG (header `typ` == `oauth-id-jag+jwt`,
+   signature against the tenant IdP's JWKS, `iss` maps to a known tenant, `aud`
+   == our issuer, `exp`, `client_id` allow-list, `jti` replay) and mints an
+   **opaque** access token — no refresh token.
+4. The app calls `/mcp/*` with `Authorization: Bearer <opaque-token>`. The
+   server accepts both minted opaque tokens (looked up locally) and direct Okta
+   JWTs.
+
+Discovery endpoints:
+
+- `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (issuer,
+  `token_endpoint`, `grant_types_supported`, and
+  `authorization_grant_profiles_supported: ["urn:ietf:params:oauth:grant-profile:id-jag"]`).
+- `GET /.well-known/oauth-protected-resource` — RFC 9728 protected-resource
+  metadata pointing at our issuer.
+
+Each tenant sets its **idjag_issuer** in `/config` (the Okta auth server that
+mints ID-JAGs; often the same as the custom auth server issuer) and configures
+Okta to mint ID-JAGs with `aud` = this server's issuer (shown in `/config`).
+
+**Demo simplifications:** the opaque-token store is in-memory (process-local,
+lost on restart); `/authorize` is a documented stub (ID-JAG is non-interactive);
+token-endpoint client authentication (private_key_jwt) is not required — the
+ID-JAG `client_id` claim is checked against the tenant allow-list instead; and
+all tenants share one issuer (`MCP_ISSUER`).
 
 ## The 100 tools
 
@@ -131,6 +171,30 @@ curl -i -X POST http://localhost:8000/mcp/ \
 ```
 
 Capture the `Mcp-Session-Id` response header and send it as a request header on subsequent calls.
+
+### ID-JAG smoke test
+
+```bash
+# 1. Discover the authorization server + protected resource metadata
+curl -s https://<your-host>/.well-known/oauth-authorization-server | jq
+curl -s https://<your-host>/.well-known/oauth-protected-resource | jq
+
+# 2. Redeem an ID-JAG (obtained from Okta) for an opaque access token
+curl -s -X POST https://<your-host>/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+  --data-urlencode "assertion=$ID_JAG"
+# => {"access_token":"<opaque>","token_type":"Bearer","expires_in":3600,"scope":"..."}
+
+# 3. Call the MCP endpoint with the minted opaque token
+curl -i -X POST https://<your-host>/mcp/ \
+  -H "Authorization: Bearer <opaque>" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+Run the offline logic test with `python tests/test_idjag.py`.
 
 ## Running from source
 
