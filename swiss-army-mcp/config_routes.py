@@ -40,12 +40,13 @@ logger = logging.getLogger(__name__)
 # HTML
 # ----------------------------------------------------------------------------
 
-def _html(redirect_uri: str) -> str:
+def _html(redirect_uri: str, issuer: str | None = None) -> str:
     scope_rows = "\n          ".join(
         f"<tr><td><code>{prefix}*</code></td><td><code>{scope}</code></td></tr>"
         for prefix, scope in TOOL_PREFIX_TO_SCOPE.items()
     )
     wildcard_scope = WILDCARD_SCOPE
+    issuer_display = issuer or "(set MCP_BASE_URL / MCP_ISSUER on the server)"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -138,6 +139,16 @@ def _html(redirect_uri: str) -> str:
   <form id="workload-form" class="hidden">
     <div class="callout">Logged in as tenant <code id="logged-in-domain"></code>.</div>
 
+    <div class="callout">
+      <div style="margin-bottom: 0.5rem;"><strong>Cross-App-Access (ID-JAG):</strong>
+        set this server's issuer as the <code>aud</code> / audience when
+        configuring ID-JAG token exchange in Okta.</div>
+      <div class="redirect-box">
+        <code id="issuer-display">{issuer_display}</code>
+        <button type="button" class="copy-btn secondary" id="copy-issuer-btn">Copy</button>
+      </div>
+    </div>
+
     <label for="custom_issuer">Custom authorization server issuer</label>
     <input id="custom_issuer" type="url" required
            placeholder="https://your-tenant.okta.com/oauth2/aus...">
@@ -145,6 +156,13 @@ def _html(redirect_uri: str) -> str:
 
     <label for="audience">Audience</label>
     <input id="audience" type="text" required placeholder="api://default">
+
+    <label for="idjag_issuer">ID-JAG issuer (optional)</label>
+    <input id="idjag_issuer" type="url"
+           placeholder="https://your-tenant.okta.com/oauth2/aus...">
+    <div class="hint">Okta auth server URL that mints ID-JAG assertions
+      (Cross-App-Access). Often the same as the custom auth server issuer above.
+      Leave empty if you only use direct Okta access tokens.</div>
 
     <label for="clients">Workload client IDs (comma-separated)</label>
     <input id="clients" type="text" placeholder="0oaXXXX...,0oaYYYY...">
@@ -289,6 +307,7 @@ async function saveWorkload(ev) {{
   const body = {{
     custom_issuer: document.getElementById('custom_issuer').value.trim(),
     audience: document.getElementById('audience').value.trim(),
+    idjag_issuer: document.getElementById('idjag_issuer').value.trim(),
     workload_client_ids: document.getElementById('clients').value
       .split(',').map(s => s.trim()).filter(Boolean),
     enforce_scopes: document.getElementById('enforce').checked,
@@ -324,6 +343,7 @@ async function showWorkload() {{
     if (cfg) {{
       document.getElementById('custom_issuer').value = cfg.custom_issuer || '';
       document.getElementById('audience').value = cfg.audience || '';
+      document.getElementById('idjag_issuer').value = cfg.idjag_issuer || '';
       document.getElementById('clients').value = (cfg.workload_client_ids || []).join(',');
       document.getElementById('enforce').checked = !!cfg.enforce_scopes;
     }}
@@ -385,6 +405,11 @@ async function main() {{
     navigator.clipboard.writeText(REDIRECT_URI);
     document.getElementById('copy-btn').textContent = 'Copied';
     setTimeout(() => document.getElementById('copy-btn').textContent = 'Copy', 1500);
+  }};
+  document.getElementById('copy-issuer-btn').onclick = () => {{
+    navigator.clipboard.writeText(document.getElementById('issuer-display').textContent);
+    document.getElementById('copy-issuer-btn').textContent = 'Copied';
+    setTimeout(() => document.getElementById('copy-issuer-btn').textContent = 'Copy', 1500);
   }};
   document.getElementById('domain-form').onsubmit = onDomainSubmit;
   document.getElementById('client-form').onsubmit = onClientSubmit;
@@ -449,16 +474,24 @@ def register_config_routes(
     store: TenantStore,
     workload_verifier: MultiTenantOktaVerifier,
     public_base_url: str | None,
+    issuer: str | None = None,
+    idjag_validator=None,
 ) -> None:
-    """Register /config* routes on the FastMCP HTTP app."""
+    """Register /config* routes on the FastMCP HTTP app.
+
+    ``issuer`` is this server's OAuth issuer identifier (shown to tenants so they
+    configure it as the ID-JAG ``aud`` in Okta). ``idjag_validator`` is
+    invalidated when a tenant changes its ID-JAG issuer so the next assertion
+    rebuilds the verifier.
+    """
 
     @mcp.custom_route("/config", methods=["GET"])
     async def config_page(request: Request) -> Response:
-        return HTMLResponse(_html(_redirect_uri(request, public_base_url)))
+        return HTMLResponse(_html(_redirect_uri(request, public_base_url), issuer))
 
     @mcp.custom_route("/config/callback", methods=["GET"])
     async def config_callback(request: Request) -> Response:
-        return HTMLResponse(_html(_redirect_uri(request, public_base_url)))
+        return HTMLResponse(_html(_redirect_uri(request, public_base_url), issuer))
 
     @mcp.custom_route("/config/lookup", methods=["GET"])
     async def config_lookup(request: Request) -> Response:
@@ -544,6 +577,7 @@ def register_config_routes(
         return JSONResponse({
             "custom_issuer": tenant.custom_issuer,
             "audience": tenant.audience,
+            "idjag_issuer": tenant.idjag_issuer,
             "workload_client_ids": tenant.workload_client_ids,
             "enforce_scopes": tenant.enforce_scopes,
         })
@@ -560,6 +594,7 @@ def register_config_routes(
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         custom_issuer = (payload.get("custom_issuer") or "").strip()
         audience = (payload.get("audience") or "").strip()
+        idjag_issuer = (payload.get("idjag_issuer") or "").strip() or None
         client_ids_raw = payload.get("workload_client_ids") or []
         if isinstance(client_ids_raw, str):
             client_ids_raw = [c.strip() for c in client_ids_raw.split(",")]
@@ -572,8 +607,14 @@ def register_config_routes(
             return JSONResponse(
                 {"error": "custom_issuer must be an https URL"}, status_code=400,
             )
+        if idjag_issuer and not idjag_issuer.startswith("https://"):
+            return JSONResponse(
+                {"error": "idjag_issuer must be an https URL"}, status_code=400,
+            )
 
         workload_verifier.invalidate(tenant.custom_issuer)
+        if idjag_validator is not None:
+            idjag_validator.invalidate(tenant.idjag_issuer)
         updated = Tenant(
             okta_domain=tenant.okta_domain,
             admin_client_id=tenant.admin_client_id,
@@ -581,6 +622,7 @@ def register_config_routes(
             audience=audience,
             workload_client_ids=client_ids,
             enforce_scopes=bool(payload.get("enforce_scopes", False)),
+            idjag_issuer=idjag_issuer,
         )
         try:
             store.save(updated)
@@ -588,6 +630,8 @@ def register_config_routes(
             logger.exception("SSM save failed")
             return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
         workload_verifier.invalidate(custom_issuer)
+        if idjag_validator is not None:
+            idjag_validator.invalidate(idjag_issuer)
         return JSONResponse({"status": "ok"})
 
 

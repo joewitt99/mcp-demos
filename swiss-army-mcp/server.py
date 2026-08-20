@@ -34,10 +34,13 @@ from html import escape as html_escape_fn
 from html import unescape as html_unescape_fn
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import MultiAuth
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 from config_routes import register_config_routes
+from idjag import IdJagValidator, OpaqueTokenVerifier, TokenStore
+from oauth_routes import register_oauth_routes
 from okta_auth import MultiTenantOktaVerifier
 from scopes import ScopeMiddleware
 from tenant_config import TenantStore
@@ -55,10 +58,45 @@ _AUTH_DISABLED = os.environ.get("MCP_AUTH_DISABLED", "").lower() == "true"
 if _AUTH_DISABLED:
     logging.warning("MCP_AUTH_DISABLED=true — Okta auth is OFF. Do not use in prod.")
 
+# Our OAuth issuer identifier for the ID-JAG flow. Customers must set this as
+# the `aud` when configuring Cross-App-Access in Okta. Defaults to MCP_BASE_URL.
+_ISSUER = (os.environ.get("MCP_ISSUER") or _PUBLIC_BASE_URL or "").rstrip("/") or None
+# Canonical resource URL advertised in protected-resource metadata (RFC 9728)
+# and stamped as the audience of minted opaque tokens.
+_RESOURCE_URL = f"{_PUBLIC_BASE_URL.rstrip('/')}/mcp/" if _PUBLIC_BASE_URL else None
+# Lifetime of minted opaque access tokens (seconds).
+_OPAQUE_TTL = int(os.environ.get("MCP_OPAQUE_TOKEN_TTL", "3600"))
+
 _store: TenantStore | None = None if _AUTH_DISABLED else TenantStore()
 _workload_verifier: MultiTenantOktaVerifier | None = (
     None if _store is None
     else MultiTenantOktaVerifier(store=_store, base_url=_PUBLIC_BASE_URL)
+)
+
+# ID-JAG: opaque-token store, validator (mints tokens at /token), and the
+# verifier that accepts those opaque tokens on /mcp/*.
+_token_store: TokenStore | None = None if _store is None else TokenStore()
+_idjag_validator: IdJagValidator | None = (
+    None if (_store is None or _ISSUER is None)
+    else IdJagValidator(store=_store, expected_audience=_ISSUER, base_url=_PUBLIC_BASE_URL)
+)
+_opaque_verifier: OpaqueTokenVerifier | None = (
+    None if _token_store is None
+    else OpaqueTokenVerifier(
+        store=_token_store,
+        resource_url=_RESOURCE_URL,
+        base_url=_PUBLIC_BASE_URL,
+    )
+)
+
+# Accept both minted opaque tokens (tried first) and Okta workload JWTs.
+_auth = (
+    None if _store is None
+    else MultiAuth(
+        verifiers=[_opaque_verifier, _workload_verifier],
+        base_url=_PUBLIC_BASE_URL,
+        resource_base_url=_PUBLIC_BASE_URL,
+    )
 )
 
 _middleware = [ScopeMiddleware(_store)] if _store is not None else []
@@ -71,7 +109,7 @@ mcp = FastMCP(
         "unit_, data_, fun_. tools/list is paginated; follow nextCursor to "
         "retrieve all 100 tools."
     ),
-    auth=_workload_verifier,
+    auth=_auth,
     middleware=_middleware,
     list_page_size=LIST_PAGE_SIZE,
 )
@@ -968,7 +1006,27 @@ if __name__ == "__main__":
             store=_store,
             workload_verifier=_workload_verifier,
             public_base_url=_PUBLIC_BASE_URL,
+            issuer=_ISSUER,
+            idjag_validator=_idjag_validator,
         )
+
+        # ID-JAG / Cross-App-Access: expose the OAuth AS metadata + token
+        # endpoint so requesting apps can redeem an ID-JAG for an opaque token.
+        if _ISSUER and _RESOURCE_URL and _idjag_validator and _token_store:
+            register_oauth_routes(
+                mcp,
+                store=_store,
+                token_store=_token_store,
+                validator=_idjag_validator,
+                issuer=_ISSUER,
+                resource_url=_RESOURCE_URL,
+                opaque_ttl=_OPAQUE_TTL,
+            )
+        else:
+            logging.warning(
+                "MCP_ISSUER/MCP_BASE_URL not set — ID-JAG token endpoint disabled. "
+                "Set MCP_BASE_URL (and optionally MCP_ISSUER) to enable it."
+            )
 
     # Stateful HTTP (default): server issues an Mcp-Session-Id on initialize
     # and returns 404 for requests carrying an unknown session ID, per the

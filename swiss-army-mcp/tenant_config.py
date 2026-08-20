@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 from dataclasses import asdict, dataclass, field
+from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
@@ -35,6 +36,12 @@ class Tenant:
     audience: str | None = None
     workload_client_ids: list[str] = field(default_factory=list)
     enforce_scopes: bool = False
+    # Okta authorization-server URL that mints ID-JAG assertions (Cross-App
+    # Access) for this customer. Often the same as ``custom_issuer``, but kept
+    # separate so a tenant can mint ID-JAGs from a dedicated auth server. When
+    # set, ID-JAGs whose ``iss`` matches this value are dispatched to this
+    # tenant. See ``idjag.py``.
+    idjag_issuer: str | None = None
 
     @property
     def has_workload_config(self) -> bool:
@@ -58,6 +65,7 @@ class Tenant:
             audience=d.get("audience") or None,
             workload_client_ids=list(d.get("workload_client_ids") or []),
             enforce_scopes=bool(d.get("enforce_scopes", False)),
+            idjag_issuer=d.get("idjag_issuer") or None,
         )
 
 
@@ -79,6 +87,7 @@ class TenantStore:
         self._lock = threading.Lock()
         self._by_domain: dict[str, Tenant] = {}
         self._by_workload_issuer: dict[str, Tenant] = {}
+        self._by_idjag_issuer: dict[str, Tenant] = {}
 
     # ------------------------------------------------------------------
     # Hydration / lookup
@@ -99,6 +108,9 @@ class TenantStore:
             self._by_workload_issuer = {
                 t.custom_issuer: t for t in loaded if t.custom_issuer
             }
+            self._by_idjag_issuer = {
+                t.idjag_issuer: t for t in loaded if t.idjag_issuer
+            }
         logger.info(
             "Hydrated %d tenant(s) from %s; %d have workload config",
             len(loaded), self.prefix, len(self._by_workload_issuer),
@@ -111,6 +123,30 @@ class TenantStore:
     def find_by_workload_issuer(self, issuer: str) -> Tenant | None:
         with self._lock:
             return self._by_workload_issuer.get(issuer)
+
+    def find_by_idjag_issuer(self, issuer: str) -> Tenant | None:
+        with self._lock:
+            return self._by_idjag_issuer.get(issuer)
+
+    def resolve_tenant_by_issuer(self, issuer: str) -> Tenant | None:
+        """Find the tenant an ID-JAG ``iss`` belongs to.
+
+        An ID-JAG's issuer may be the tenant's dedicated ``idjag_issuer``, its
+        workload ``custom_issuer``, or its org auth server (``org_issuer``).
+        Try each, matching ``org_issuer`` by URL host so a bare org issuer
+        (``https://<domain>``) resolves regardless of trailing path.
+        """
+        if not issuer:
+            return None
+        with self._lock:
+            hit = self._by_idjag_issuer.get(issuer) or self._by_workload_issuer.get(issuer)
+            if hit is not None:
+                return hit
+            host = urlparse(issuer).netloc.lower()
+            for t in self._by_domain.values():
+                if urlparse(t.org_issuer).netloc.lower() == host:
+                    return t
+        return None
 
     def all(self) -> list[Tenant]:
         with self._lock:
@@ -130,15 +166,20 @@ class TenantStore:
             Overwrite=True,
         )
         with self._lock:
-            # If updating an existing entry, evict the old workload-issuer
-            # index entry first (the issuer may have changed).
+            # If updating an existing entry, evict the old issuer index entries
+            # first (either issuer may have changed).
             old = self._by_domain.get(tenant.okta_domain.lower())
             if old and old.custom_issuer and old.custom_issuer in self._by_workload_issuer:
                 if self._by_workload_issuer.get(old.custom_issuer) is old:
                     del self._by_workload_issuer[old.custom_issuer]
+            if old and old.idjag_issuer and old.idjag_issuer in self._by_idjag_issuer:
+                if self._by_idjag_issuer.get(old.idjag_issuer) is old:
+                    del self._by_idjag_issuer[old.idjag_issuer]
             self._by_domain[tenant.okta_domain.lower()] = tenant
             if tenant.custom_issuer:
                 self._by_workload_issuer[tenant.custom_issuer] = tenant
+            if tenant.idjag_issuer:
+                self._by_idjag_issuer[tenant.idjag_issuer] = tenant
         logger.info(
             "Saved tenant %s (workload_config=%s, enforce_scopes=%s)",
             tenant.okta_domain, tenant.has_workload_config, tenant.enforce_scopes,
