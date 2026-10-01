@@ -9,7 +9,10 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY server.py okta_auth.py tenant_config.py config_routes.py scopes.py ./
+# Every top-level module server.py imports. Globbed rather than listed
+# per-file so adding a module can't silently break the image (tests/
+# is a subdirectory and is not copied).
+COPY *.py ./
 
 EXPOSE 8000
 ENV PORT=8000
