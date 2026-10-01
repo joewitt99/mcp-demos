@@ -81,7 +81,7 @@ async def main():
             r = await client.get("/.well-known/oauth-protected-resource")
             p = r.json()
             ck("PRM 200", r.status_code == 200)
-            ck("PRM resource", p["resource"] == f"{ISSUER}/mcp/")
+            ck("PRM resource", p["resource"] == f"{ISSUER}/mcp")
             ck("PRM auth servers", p["authorization_servers"] == [ISSUER])
 
             r = await client.get("/authorize")
@@ -107,6 +107,19 @@ async def main():
             ck("bad grant -> unsupported_grant_type", r.json()["error"] == "unsupported_grant_type")
 
             # missing assertion
+            # RFC 9728 §3.1: the PRM lives at the well-known prefix + the
+            # resource's path. This is the URL the 401 challenge advertises and
+            # the first one MCP clients fetch, so it must resolve — serving only
+            # the root path 404'd every spec-compliant client's discovery.
+            r = await client.get("/.well-known/oauth-protected-resource/mcp")
+            ck("PRM path-based 200", r.status_code == 200)
+            ck("PRM path-based resource", r.json()["resource"] == f"{ISSUER}/mcp")
+
+            r = await client.get("/.well-known/oauth-protected-resource")
+            ck("PRM root 200", r.status_code == 200)
+            ck("PRM root resource no trailing slash", r.json()["resource"] == f"{ISSUER}/mcp")
+            ck("PRM root authz server", r.json()["authorization_servers"] == [ISSUER])
+
             r = await client.post("/token", data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer"})
             ck("missing assertion -> invalid_request", r.json()["error"] == "invalid_request")
 

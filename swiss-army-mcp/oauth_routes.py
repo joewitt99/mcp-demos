@@ -7,7 +7,8 @@ for the validation and token-minting logic.
 
 Routes registered here:
   - GET  /.well-known/oauth-authorization-server   (RFC 8414 AS metadata)
-  - GET  /.well-known/oauth-protected-resource     (RFC 9728 PRM)
+  - GET  /.well-known/oauth-protected-resource     (RFC 9728 PRM, root)
+  - GET  /.well-known/oauth-protected-resource/mcp (RFC 9728 PRM, path-based)
   - GET  /authorize                                (documented stub)
   - POST /token                                    (jwt-bearer / ID-JAG)
 """
@@ -15,6 +16,7 @@ Routes registered here:
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlparse
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -78,14 +80,36 @@ def register_oauth_routes(
             "code_challenge_methods_supported": ["S256"],
         })
 
-    @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
-    async def protected_resource_metadata(_request: Request) -> Response:
+    # RFC 9728 §3.1 builds the metadata URL by inserting the *resource's path*
+    # after the well-known segment, so the resource https://host/mcp is
+    # described at /.well-known/oauth-protected-resource/mcp. That is the URL
+    # the 401 challenge advertises in `resource_metadata`, and what MCP clients
+    # fetch first (mcp/client/auth/utils.py tries path-based, then root-based).
+    # Serving only the root path made every spec-compliant client 404 on
+    # discovery, so register both.
+    _resource_path = urlparse(resource_url).path.rstrip("/")
+    _prm_paths = ["/.well-known/oauth-protected-resource"]
+    if _resource_path:
+        _prm_paths.append(f"/.well-known/oauth-protected-resource{_resource_path}")
+
+    def _prm_body() -> Response:
         return JSONResponse({
-            "resource": resource_url,
+            # Must match the resource identifier in the challenge, which the
+            # SDK derives without a trailing slash.
+            "resource": resource_url.rstrip("/"),
             "authorization_servers": [issuer],
             "scopes_supported": ALL_SCOPES,
             "bearer_methods_supported": ["header"],
         })
+
+    for _i, _prm_path in enumerate(_prm_paths):
+        # Bind the handler per iteration and give each a distinct __name__ so
+        # neither registration shadows the other.
+        async def protected_resource_metadata(_request: Request) -> Response:
+            return _prm_body()
+
+        protected_resource_metadata.__name__ = f"protected_resource_metadata_{_i}"
+        mcp.custom_route(_prm_path, methods=["GET"])(protected_resource_metadata)
 
     @mcp.custom_route("/authorize", methods=["GET"])
     async def authorize(_request: Request) -> Response:
