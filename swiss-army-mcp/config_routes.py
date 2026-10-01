@@ -582,6 +582,60 @@ def register_config_routes(
             "enforce_scopes": tenant.enforce_scopes,
         })
 
+    @mcp.custom_route("/config/client-secret", methods=["POST"])
+    async def client_secret_post(request: Request) -> Response:
+        """Generate (or rotate) the client secret for one workload client_id.
+
+        The plaintext is returned exactly once in this response and is never
+        stored or recoverable: only a salted hash is persisted. Rotating
+        invalidates the previous secret immediately.
+        """
+        token = _bearer_token(request)
+        tenant = await _resolve_admin(token, store)
+        if tenant is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        client_id = (payload.get("client_id") or "").strip()
+        if not client_id:
+            return JSONResponse({"error": "missing client_id"}, status_code=400)
+
+        rotated = client_id in tenant.workload_client_secrets
+        secret = tenant.set_client_secret(client_id)
+        store.save(tenant)
+        logger.info(
+            "%s client secret for client_id=%s tenant=%s",
+            "Rotated" if rotated else "Issued", client_id, tenant.okta_domain,
+        )
+        return JSONResponse(
+            {
+                "client_id": client_id,
+                "client_secret": secret,
+                "rotated": rotated,
+                "note": "Copy this now — it is not retrievable later.",
+            },
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    @mcp.custom_route("/config/client-secret", methods=["GET"])
+    async def client_secret_get(request: Request) -> Response:
+        """Which workload clients have a secret registered. Never the secrets."""
+        token = _bearer_token(request)
+        tenant = await _resolve_admin(token, store)
+        if tenant is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return JSONResponse({
+            "clients": [
+                {
+                    "client_id": cid,
+                    "has_secret": cid in tenant.workload_client_secrets,
+                }
+                for cid in tenant.workload_client_ids
+            ]
+        })
+
     @mcp.custom_route("/config/workload", methods=["POST"])
     async def workload_post(request: Request) -> Response:
         token = _bearer_token(request)
@@ -621,6 +675,14 @@ def register_config_routes(
             custom_issuer=custom_issuer,
             audience=audience,
             workload_client_ids=client_ids,
+            # Carry existing secrets across the rewrite — dropping them would
+            # silently break every client that already authenticates. Secrets
+            # for client_ids removed from the allow-list are pruned here, so
+            # deleting a client_id also revokes its credential.
+            workload_client_secrets={
+                cid: h for cid, h in tenant.workload_client_secrets.items()
+                if cid in client_ids
+            },
             enforce_scopes=bool(payload.get("enforce_scopes", False)),
             idjag_issuer=idjag_issuer,
         )

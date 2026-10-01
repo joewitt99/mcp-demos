@@ -56,6 +56,10 @@ async def main():
     store._by_domain[t.okta_domain] = t
     store._by_workload_issuer[IDP] = t; store._by_idjag_issuer[IDP] = t
 
+    # /token requires client authentication: give the fixture client a secret.
+    CLIENT_SECRET = t.set_client_secret("client-abc")
+    BASIC = "Basic " + base64.b64encode(f"client-abc:{CLIENT_SECRET}".encode()).decode()
+
     token_store = idjag.TokenStore()
     validator = idjag.IdJagValidator(store=store, expected_audience=ISSUER)
     validator._verifiers[IDP] = FakeVerifier(ISSUER)
@@ -90,10 +94,10 @@ async def main():
             now = int(time.time())
             jag = make_jag(iss=IDP, sub="U123", aud=ISSUER, client_id="client-abc",
                            jti="jr1", exp=now + 300, iat=now, scope="swiss-army-mcp:text")
-            r = await client.post("/token", data={
+            r = await client.post("/token", headers={"Authorization": BASIC}, data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jag})
             tok = r.json()
-            ck("token 200", r.status_code == 200)
+            ck("token 200 (client_secret_basic)", r.status_code == 200)
             ck("token opaque + bearer", tok["token_type"] == "Bearer" and len(tok["access_token"]) > 20)
             ck("no refresh token", "refresh_token" not in tok)
             ck("scope echoed", tok["scope"] == "swiss-army-mcp:text")
@@ -126,9 +130,77 @@ async def main():
             # bad aud -> invalid_grant
             jag2 = make_jag(iss=IDP, sub="U1", aud="https://wrong", client_id="client-abc",
                             jti="jr2", exp=now + 300, iat=now)
-            r = await client.post("/token", data={
+            r = await client.post("/token", headers={"Authorization": BASIC}, data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jag2})
             ck("bad aud -> invalid_grant 400", r.status_code == 400 and r.json()["error"] == "invalid_grant")
+
+            # ---- client authentication at /token ----
+            def jag_for(cid, jti):
+                return make_jag(iss=IDP, sub="U123", aud=ISSUER, client_id=cid,
+                                jti=jti, exp=now + 300, iat=now,
+                                scope="swiss-army-mcp:text")
+
+            # no credentials at all -> 401 invalid_client + challenge
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-abc", "ca1")})
+            ck("no creds -> 401 invalid_client",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+            ck("no creds -> WWW-Authenticate",
+               r.headers.get("www-authenticate", "").startswith("Basic "))
+
+            # wrong secret -> 401 invalid_client
+            bad = "Basic " + base64.b64encode(b"client-abc:wrong").decode()
+            r = await client.post("/token", headers={"Authorization": bad}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-abc", "ca2")})
+            ck("wrong secret -> 401 invalid_client",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+
+            # unknown client_id -> 401 invalid_client
+            unk = "Basic " + base64.b64encode(f"nope:{CLIENT_SECRET}".encode()).decode()
+            r = await client.post("/token", headers={"Authorization": unk}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-abc", "ca3")})
+            ck("unknown client -> 401 invalid_client",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+
+            # client_secret_post works too
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-abc", "ca4"),
+                "client_id": "client-abc", "client_secret": CLIENT_SECRET})
+            ck("client_secret_post -> 200", r.status_code == 200)
+
+            # THE binding check: authenticate as client-abc, present an
+            # assertion issued to a different registered client.
+            other_secret = t.set_client_secret("client-xyz")
+            r = await client.post("/token", headers={"Authorization": BASIC}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-xyz", "ca5")})
+            ck("cross-client replay -> invalid_grant",
+               r.status_code == 400 and r.json()["error"] == "invalid_grant")
+
+            # the rightful client can redeem its own assertion
+            own = "Basic " + base64.b64encode(f"client-xyz:{other_secret}".encode()).decode()
+            r = await client.post("/token", headers={"Authorization": own}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-xyz", "ca6")})
+            ck("rightful client -> 200", r.status_code == 200)
+
+            # rotation invalidates the old secret
+            t.set_client_secret("client-abc")
+            r = await client.post("/token", headers={"Authorization": BASIC}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag_for("client-abc", "ca7")})
+            ck("rotated secret invalidates old",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+
+            # metadata advertises the real auth methods
+            m2 = (await client.get("/.well-known/oauth-authorization-server")).json()
+            ck("metadata advertises client auth",
+               m2["token_endpoint_auth_methods_supported"] ==
+               ["client_secret_basic", "client_secret_post"])
 
     nf = sum(1 for _, c in results if not c)
     print(f"\n{len(results)-nf}/{len(results)} passed")

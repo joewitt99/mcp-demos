@@ -13,9 +13,12 @@ Configuration:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import threading
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
@@ -24,6 +27,49 @@ import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Workload client secrets
+#
+# /token requires client authentication (RFC 6749 client_secret_basic or
+# client_secret_post). Secrets are generated here, shown to the admin exactly
+# once, and persisted only as a salted SHA-256 hash: the tenant blob is a plain
+# SSM ``String`` (see TenantStore.save), so anything with ssm:GetParameter on
+# the prefix can read it. A hash keeps a leaked parameter from yielding usable
+# credentials. Plain SHA-256 is adequate because the secret is 256 bits of
+# os.urandom, not a human-chosen password.
+# ---------------------------------------------------------------------------
+
+_SECRET_SCHEME = "sha256"
+
+
+def generate_client_secret() -> str:
+    """A fresh 256-bit client secret, URL-safe. Shown once, never stored."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_client_secret(secret: str, *, salt: bytes | None = None) -> str:
+    """Encode as ``sha256$<salt_hex>$<digest_hex>``."""
+    salt = salt if salt is not None else secrets.token_bytes(16)
+    digest = hashlib.sha256(salt + secret.encode()).hexdigest()
+    return f"{_SECRET_SCHEME}${salt.hex()}${digest}"
+
+
+def verify_client_secret(secret: str, stored: str) -> bool:
+    """Constant-time check of ``secret`` against a stored hash."""
+    try:
+        scheme, salt_hex, digest_hex = stored.split("$", 2)
+    except ValueError:
+        return False
+    if scheme != _SECRET_SCHEME:
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        return False
+    expected = hashlib.sha256(salt + secret.encode()).hexdigest()
+    return hmac.compare_digest(expected, digest_hex)
 
 
 @dataclass
@@ -35,6 +81,11 @@ class Tenant:
     custom_issuer: str | None = None
     audience: str | None = None
     workload_client_ids: list[str] = field(default_factory=list)
+    # client_id -> salted hash of that client's secret, as produced by
+    # hash_client_secret. A client_id present in workload_client_ids but absent
+    # here cannot redeem an ID-JAG: /token requires client authentication for
+    # every tenant.
+    workload_client_secrets: dict[str, str] = field(default_factory=dict)
     enforce_scopes: bool = False
     # Okta authorization-server URL that mints ID-JAG assertions (Cross-App
     # Access) for this customer. Often the same as ``custom_issuer``, but kept
@@ -42,6 +93,33 @@ class Tenant:
     # set, ID-JAGs whose ``iss`` matches this value are dispatched to this
     # tenant. See ``idjag.py``.
     idjag_issuer: str | None = None
+
+    def verify_client(self, client_id: str, secret: str) -> bool:
+        """True when ``client_id`` is allow-listed AND its secret matches.
+
+        Both conditions are required: registering a client_id without a secret
+        does not grant it access.
+        """
+        if not client_id or not secret:
+            return False
+        if self.workload_client_ids and client_id not in self.workload_client_ids:
+            return False
+        stored = self.workload_client_secrets.get(client_id)
+        if not stored:
+            return False
+        return verify_client_secret(secret, stored)
+
+    def set_client_secret(self, client_id: str) -> str:
+        """Generate, store the hash of, and return a new secret for ``client_id``.
+
+        The plaintext is returned to the caller for one-time display and is not
+        retained anywhere.
+        """
+        secret = generate_client_secret()
+        self.workload_client_secrets[client_id] = hash_client_secret(secret)
+        if client_id not in self.workload_client_ids:
+            self.workload_client_ids.append(client_id)
+        return secret
 
     @property
     def has_workload_config(self) -> bool:
@@ -64,6 +142,7 @@ class Tenant:
             custom_issuer=d.get("custom_issuer") or None,
             audience=d.get("audience") or None,
             workload_client_ids=list(d.get("workload_client_ids") or []),
+            workload_client_secrets=dict(d.get("workload_client_secrets") or {}),
             enforce_scopes=bool(d.get("enforce_scopes", False)),
             idjag_issuer=d.get("idjag_issuer") or None,
         )
