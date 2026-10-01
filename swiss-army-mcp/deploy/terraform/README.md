@@ -31,6 +31,46 @@ Bring your own: ACM cert (same region) and Route 53 hosted zone.
 | BYO VPC | `create_vpc = false` (default) + `vpc_id`, `public_subnet_ids`, `task_subnet_ids` | Use existing networking. Set `assign_public_ip = true` if task subnets are public and have no NAT. |
 | Terraform creates | `create_vpc = true` (+ optional `new_vpc_cidr`) | Minimal demo VPC: 1 VPC, IGW, 2 public /20 subnets in different AZs, default route. Tasks run in the public subnets with public IPs (no NAT, no extra cost). The BYO vars are ignored. |
 
+## Running a second instance in the same VPC
+
+Every resource name is derived from `var.name` (default `swiss-army-mcp`), so a
+second stack is a second tfvars + a second state file — no code changes.
+
+```bash
+cd mcp-demos/swiss-army-mcp/deploy/terraform
+cp second-instance.tfvars.example xaa.tfvars
+$EDITOR xaa.tfvars                      # set name, hostname, cert_arn; reuse vpc_id/subnets
+
+terraform workspace new xaa
+terraform apply -var-file=xaa.tfvars
+```
+
+`terraform workspace` keeps the two state files apart in one directory. To
+switch back: `terraform workspace select default`, then apply with
+`terraform.tfvars` as usual. (A separate clone of this directory works too, if
+you prefer two independent local states.)
+
+Each stack gets its own ALB, target group, ECS cluster/service, IAM roles,
+security groups, log group and Route 53 record. They share only the VPC,
+subnets, hosted zone, and — optionally — the ACM cert and the SSM tenants
+prefix.
+
+| Must differ between stacks | Can be shared |
+| --- | --- |
+| `name`, `hostname` | `aws_region`, `vpc_id`, `public_subnet_ids`, `task_subnet_ids`, `hosted_zone_id` |
+| Route 53 record (follows `hostname`) | `cert_arn`, if the cert covers both names (e.g. a `*.bridge.oktaproserv.com` wildcard) |
+| | `tenants_prefix` — share it so tenants onboard once for both; or set a distinct prefix per stack for isolated tenant configs |
+
+`MCP_BASE_URL` (and therefore `MCP_ISSUER`, which defaults to it) is derived
+from `hostname`, so each stack is its own ID-JAG issuer and audience with no
+extra configuration.
+
+Cost of the second stack: one more ALB (~$16/mo) plus one more Fargate task.
+To avoid the extra ALB you would need to share the first stack's listener — add
+a second host-header rule (distinct `priority`) and target group against it
+instead of creating an `aws_lb`. That is a larger refactor than this module
+currently supports.
+
 ## Running from EC2
 
 Use an Amazon Linux EC2 with an **IAM instance profile** that has the
