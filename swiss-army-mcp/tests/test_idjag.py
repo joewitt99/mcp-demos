@@ -88,6 +88,10 @@ def make_store():
         enforce_scopes=True,
         idjag_issuer=IDP,
     )
+    # Mode 2's allow-list comes from the client registry, not from
+    # workload_client_ids (that is mode 1 — direct Okta tokens on /mcp).
+    # Register a credential so client-abc is permitted to redeem ID-JAGs.
+    t.register_client("client-abc")
     store._by_domain[t.okta_domain] = t
     store._by_workload_issuer[t.custom_issuer] = t
     store._by_idjag_issuer[t.idjag_issuer] = t

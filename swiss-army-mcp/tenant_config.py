@@ -161,18 +161,21 @@ class Tenant:
 
     @property
     def idjag_client_ids(self) -> list[str]:
-        """Okta apps permitted to redeem ID-JAGs, from our client registry.
+        """Okta apps permitted to redeem ID-JAGs (mode 2), from our registry.
 
-        Separate from workload_client_ids, which gates the direct Okta-token
-        flow on /mcp. Falls back to that list only when no credential has been
-        issued yet, so a tenant configured before the registry existed keeps
-        working.
+        Deliberately has NO fallback to workload_client_ids: that field belongs
+        to mode 1 (direct Okta access tokens on /mcp) and the two modes share
+        nothing but scopes. Reading it here would make mode 2's behaviour
+        depend on mode 1's configuration.
+
+        An empty list means no credential has been issued, in which case
+        /token's client-authentication gate already rejected the caller before
+        this is consulted.
         """
-        from_registry = [
+        return [
             rec.get("okta_client_id") for rec in self.clients.values()
             if rec.get("okta_client_id")
         ]
-        return from_registry or list(self.workload_client_ids)
 
     @property
     def has_workload_config(self) -> bool:

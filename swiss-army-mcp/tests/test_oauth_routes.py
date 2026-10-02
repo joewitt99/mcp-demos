@@ -255,9 +255,10 @@ async def main():
             td.revoke_client(xcid)
             ck("revoke leaves direct flow intact",
                td.workload_client_ids == before)
-            # and with no credentials issued, the legacy list is the fallback
-            ck("empty registry falls back to legacy list",
-               td.idjag_client_ids == ["direct-only-app"])
+            # with no credential issued the XAA list is empty — it must NOT
+            # fall back to mode 1's allow-list. The modes share only scopes.
+            ck("empty registry does not borrow mode 1's list",
+               td.idjag_client_ids == [])
 
             # metadata advertises the real auth methods
             m2 = (await client.get("/.well-known/oauth-authorization-server")).json()
