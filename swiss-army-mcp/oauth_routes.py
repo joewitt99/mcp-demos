@@ -10,16 +10,13 @@ Routes registered here:
   - GET  /.well-known/oauth-protected-resource     (RFC 9728 PRM, root)
   - GET  /.well-known/oauth-protected-resource/mcp (RFC 9728 PRM, path-based)
   - GET  /authorize                                (documented stub)
-  - POST /token                                    (jwt-bearer / ID-JAG; client
-                                                    auth required)
+  - POST /token                                    (jwt-bearer / ID-JAG)
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
 import logging
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -38,40 +35,6 @@ from tenant_config import TenantStore
 logger = logging.getLogger(__name__)
 
 _NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
-
-
-def _invalid_client(description: str) -> JSONResponse:
-    """RFC 6749 §5.2: invalid_client is 401 and carries a challenge."""
-    return JSONResponse(
-        {"error": "invalid_client", "error_description": description},
-        status_code=401,
-        headers={**_NO_STORE, "WWW-Authenticate": 'Basic realm="token"'},
-    )
-
-
-def _parse_client_auth(request: Request, form) -> tuple[str, str, str] | None:
-    """Extract client credentials, preferring Basic over form parameters.
-
-    Returns (client_id, client_secret, method) or None when absent. Per RFC
-    6749 §2.3.1 the Basic userid/password are form-urlencoded before base64, so
-    they must be unquoted after splitting.
-    """
-    header = request.headers.get("authorization") or ""
-    if header[:6].lower() == "basic ":
-        try:
-            raw = base64.b64decode(header[6:].strip(), validate=True).decode()
-        except (binascii.Error, UnicodeDecodeError, ValueError):
-            return None
-        if ":" not in raw:
-            return None
-        cid, _, sec = raw.partition(":")
-        return unquote(cid), unquote(sec), "client_secret_basic"
-
-    cid = (form.get("client_id") or "").strip()
-    sec = (form.get("client_secret") or "").strip()
-    if cid and sec:
-        return cid, sec, "client_secret_post"
-    return None
 
 
 def _oauth_error(error: str, description: str, status: int = 400) -> JSONResponse:
@@ -112,10 +75,7 @@ def register_oauth_routes(
             "grant_types_supported": [JWT_BEARER_GRANT],
             "authorization_grant_profiles_supported": [ID_JAG_GRANT_PROFILE],
             "response_types_supported": [],
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_basic",
-                "client_secret_post",
-            ],
+            "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": ALL_SCOPES,
             "code_challenge_methods_supported": ["S256"],
         })
@@ -174,33 +134,6 @@ def register_oauth_routes(
                 f"only '{JWT_BEARER_GRANT}' is supported",
             )
 
-        # RFC 6749 §5.2: authenticate the client before processing the grant.
-        # Our client_ids are globally unique (we issue them), so the caller
-        # resolves to a tenant and an Okta client_id without reading the
-        # assertion at all.
-        creds = _parse_client_auth(request, form)
-        if creds is None:
-            return _invalid_client(
-                "client authentication required: use HTTP Basic "
-                "(client_secret_basic) or client_id/client_secret form "
-                "parameters (client_secret_post)"
-            )
-        auth_client_id, auth_client_secret, auth_method = creds
-
-        found = store.find_client(auth_client_id)
-        client_record = (
-            found[0].authenticate_client(auth_client_id, auth_client_secret)
-            if found else None
-        )
-        if not client_record:
-            logger.warning(
-                "Client auth failed at /token (method=%s) for client_id=%r",
-                auth_method, auth_client_id,
-            )
-            return _invalid_client("client authentication failed")
-        client_tenant = found[0]
-        expected_okta_client_id = client_record.get("okta_client_id") or ""
-
         assertion = (form.get("assertion") or "").strip()
         if not assertion:
             return _oauth_error("invalid_request", "missing 'assertion' parameter")
@@ -216,33 +149,6 @@ def register_oauth_routes(
                 peek.get("sub"), peek.get("client_id"), peek.get("exp"),
             )
             return _oauth_error(e.oauth_error, e.description)
-
-        # Bind the credential to the assertion. The credential is registered
-        # for exactly one Okta app, so it may only redeem an ID-JAG issued to
-        # that app — otherwise any authenticated client could replay another's.
-        if claims.client_id != expected_okta_client_id:
-            logger.warning(
-                "Client/assertion mismatch at /token: credential %r is "
-                "registered for okta_client_id=%r but the assertion names %r",
-                auth_client_id, expected_okta_client_id, claims.client_id,
-            )
-            return _oauth_error(
-                "invalid_grant",
-                "assertion was not issued to the authenticated client",
-            )
-
-        # And it may only speak for its own tenant, so one customer's
-        # credential cannot redeem another customer's assertion.
-        if claims.tenant_domain != client_tenant.okta_domain:
-            logger.warning(
-                "Cross-tenant redemption blocked: credential %r belongs to %s "
-                "but the assertion resolved to %s",
-                auth_client_id, client_tenant.okta_domain, claims.tenant_domain,
-            )
-            return _oauth_error(
-                "invalid_grant",
-                "assertion does not belong to this client's tenant",
-            )
 
         # Optional down-scoping: a requested 'scope' may only narrow, not widen.
         granted = list(claims.scopes)

@@ -47,6 +47,10 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     )
     wildcard_scope = WILDCARD_SCOPE
     issuer_display = issuer or "(set MCP_BASE_URL / MCP_ISSUER on the server)"
+    resource_display = (
+        issuer.rstrip("/") + "/mcp" if issuer
+        else "(set MCP_BASE_URL / MCP_ISSUER on the server)"
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -88,21 +92,10 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     details.scope-ref table {{ width: 100%; border-collapse: collapse; margin-top: 0.25rem; }}
     details.scope-ref th, details.scope-ref td {{ padding: 0.3rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }}
     details.scope-ref th {{ font-weight: 600; color: #444; background: #fafafa; }}
-    .cred-section {{ margin-top: 3rem; padding-top: 2rem; border-top: 2px solid #e5e5e5; }}
-    .cred-section h2 {{ font-size: 1.15rem; margin: 0 0 0.5rem; }}
-    .cred-row {{ display: flex; gap: 0.5rem; align-items: flex-start;
-                 padding: 0.6rem 0; border-bottom: 1px solid #eee; font-size: 0.85rem; }}
-    .cred-row .cred-meta {{ flex: 1; min-width: 0; }}
-    .cred-row code {{ word-break: break-all; }}
-    .cred-row .cred-sub {{ color: #777; font-size: 0.8rem; margin-top: 0.2rem; }}
-    .cred-row button {{ margin: 0; padding: 0.3rem 0.7rem; font-size: 0.8rem; }}
-    .cred-row button.danger {{ background: #a62121; }}
-    .secret-panel {{ background: #fff8e1; border: 1px solid #f0c948;
-                     border-radius: 6px; padding: 1rem; margin-top: 1rem; }}
-    .secret-panel .warn {{ color: #6b4f00; font-weight: 600; margin-bottom: 0.75rem;
-                           font-size: 0.85rem; }}
-    .secret-panel label {{ margin-top: 0.75rem; font-size: 0.8rem; }}
-    .empty-note {{ color: #777; font-size: 0.85rem; padding: 0.75rem 0; }}
+    .xaa-section {{ margin-top: 2.5rem; padding-top: 1.5rem; border-top: 2px solid #e5e5e5; }}
+    .xaa-section h2 {{ font-size: 1.1rem; margin: 0 0 0.35rem; }}
+    .xaa-field {{ margin-top: 0.9rem; }}
+    .xaa-field .xaa-label {{ font-weight: 500; font-size: 0.85rem; margin-bottom: 0.25rem; }}
   </style>
 </head>
 <body>
@@ -154,14 +147,46 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
   <form id="workload-form" class="hidden">
     <div class="callout">Logged in as tenant <code id="logged-in-domain"></code>.</div>
 
-    <div class="callout">
-      <div style="margin-bottom: 0.5rem;"><strong>Cross-App-Access (ID-JAG):</strong>
-        set this server's issuer as the <code>aud</code> / audience when
-        configuring ID-JAG token exchange in Okta.</div>
-      <div class="redirect-box">
-        <code id="issuer-display">{issuer_display}</code>
-        <button type="button" class="copy-btn secondary" id="copy-issuer-btn">Copy</button>
+    <div class="xaa-section">
+      <h2>Cross-App-Access (XAA) connector values</h2>
+      <div class="subtle" style="margin-bottom: 0.5rem;">
+        Paste these into Okta when you add this server as a resource server
+        connector. XAA needs no client ID or secret &mdash; trust comes from the
+        ID-JAG's signature, which this server validates against your Okta JWKS.
       </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Resource URL</div>
+        <div class="redirect-box">
+          <code id="xaa-resource">{resource_display}</code>
+          <button type="button" class="copy-btn secondary" data-copy="xaa-resource">Copy</button>
+        </div>
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Issuer URL</div>
+        <div class="redirect-box">
+          <code id="issuer-display">{issuer_display}</code>
+          <button type="button" class="copy-btn secondary" data-copy="issuer-display">Copy</button>
+        </div>
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Audience / tenant ID</div>
+        <div class="redirect-box">
+          <code id="xaa-audience">{issuer_display}</code>
+          <button type="button" class="copy-btn secondary" data-copy="xaa-audience">Copy</button>
+        </div>
+        <div class="hint">This server requires the ID-JAG's <code>aud</code> to equal
+          this value exactly &mdash; no path, no trailing slash.</div>
+      </div>
+
+      <label for="idjag_clients">ID-JAG client IDs (optional, comma-separated)</label>
+      <input id="idjag_clients" type="text" placeholder="0oaXXXX...,0oaYYYY...">
+      <div class="hint">Okta apps allowed to redeem an ID-JAG here, matched against
+        the assertion's <code>client_id</code> claim. Leave empty to allow any.
+        Separate from Workload client IDs above, which governs direct
+        <code>/mcp</code> tokens &mdash; neither list affects the other.</div>
     </div>
 
     <label for="custom_issuer">Custom authorization server issuer</label>
@@ -211,44 +236,6 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     <button id="save-btn" type="submit">Save configuration</button>
     <button id="signout-btn" class="secondary" type="button">Sign out</button>
     <div id="workload-msg" class="msg hidden"></div>
-
-    <!-- Step 4: XAA client credentials -->
-    <div class="cred-section">
-      <h2>Cross-App-Access client credentials</h2>
-      <div class="subtle" style="margin-bottom: 1rem;">
-        Each app that redeems an ID-JAG at <code id="token-ep-display"></code>
-        needs a credential issued here. This is separate from the app's Okta
-        client secret: that one authenticates to Okta to mint the assertion,
-        this one authenticates to this server to redeem it.
-      </div>
-
-      <label for="new_okta_client_id">Okta client ID of the requesting app</label>
-      <input id="new_okta_client_id" type="text" placeholder="0oa..." autocomplete="off">
-      <div class="hint">The app performing the Cross-App-Access token exchange.
-        Issuing a credential here does <strong>not</strong> grant it direct
-        <code>/mcp</code> access &mdash; that is the Workload client IDs field above.</div>
-      <button id="issue-btn" type="button">Issue credential</button>
-      <div id="cred-msg" class="msg hidden"></div>
-
-      <div id="secret-panel" class="secret-panel hidden">
-        <div class="warn">&#9888; Copy the secret now &mdash; it is hashed on save and
-          cannot be shown again.</div>
-        <label>Client ID</label>
-        <div class="redirect-box">
-          <code id="new-client-id"></code>
-          <button type="button" class="copy-btn secondary" data-copy="new-client-id">Copy</button>
-        </div>
-        <label>Client secret</label>
-        <div class="redirect-box">
-          <code id="new-client-secret"></code>
-          <button type="button" class="copy-btn secondary" data-copy="new-client-secret">Copy</button>
-        </div>
-        <button type="button" class="secondary" id="dismiss-secret-btn">Done</button>
-      </div>
-
-      <h2 style="margin-top: 2rem; font-size: 1rem;">Issued credentials</h2>
-      <div id="cred-list"></div>
-    </div>
   </form>
 
 <script>
@@ -363,6 +350,8 @@ async function saveWorkload(ev) {{
     idjag_issuer: document.getElementById('idjag_issuer').value.trim(),
     workload_client_ids: document.getElementById('clients').value
       .split(',').map(s => s.trim()).filter(Boolean),
+    idjag_client_ids: document.getElementById('idjag_clients').value
+      .split(',').map(s => s.trim()).filter(Boolean),
     enforce_scopes: document.getElementById('enforce').checked,
   }};
   try {{
@@ -383,147 +372,6 @@ async function saveWorkload(ev) {{
   }}
 }}
 
-const AUTH = () => ({{ Authorization: 'Bearer ' + SS.getItem('access_token') }});
-
-async function loadClients() {{
-  const r = await fetch('/config/clients', {{ headers: AUTH() }});
-  if (!r.ok) throw new Error(await r.text());
-  return (await r.json()).clients || [];
-}}
-
-function renderClients(list) {{
-  const box = document.getElementById('cred-list');
-  box.textContent = '';
-  if (!list.length) {{
-    const d = document.createElement('div');
-    d.className = 'empty-note';
-    d.textContent = 'No credentials issued yet. Without one, no app can redeem an ID-JAG.';
-    box.appendChild(d);
-    return;
-  }}
-  for (const c of list) {{
-    const row = document.createElement('div');
-    row.className = 'cred-row';
-
-    const meta = document.createElement('div');
-    meta.className = 'cred-meta';
-    const cid = document.createElement('code');
-    cid.textContent = c.client_id;
-    meta.appendChild(cid);
-    const sub = document.createElement('div');
-    sub.className = 'cred-sub';
-    sub.textContent = 'for Okta app ' + (c.okta_client_id || '(none)') +
-      (c.created ? ' \u00b7 issued ' + c.created : '') +
-      (c.rotated ? ' \u00b7 rotated ' + c.rotated : '');
-    meta.appendChild(sub);
-    row.appendChild(meta);
-
-    const rot = document.createElement('button');
-    rot.type = 'button';
-    rot.className = 'secondary';
-    rot.textContent = 'Rotate';
-    rot.onclick = () => rotateCredential(c.client_id);
-    row.appendChild(rot);
-
-    // Two-step revoke: no browser confirm() dialog, and no accidental deletes.
-    const rev = document.createElement('button');
-    rev.type = 'button';
-    rev.className = 'danger';
-    rev.textContent = 'Revoke';
-    rev.dataset.armed = '';
-    rev.onclick = () => {{
-      if (!rev.dataset.armed) {{
-        rev.dataset.armed = '1';
-        rev.textContent = 'Confirm?';
-        setTimeout(() => {{ rev.dataset.armed = ''; rev.textContent = 'Revoke'; }}, 4000);
-        return;
-      }}
-      revokeCredential(c.client_id);
-    }};
-    row.appendChild(rev);
-
-    box.appendChild(row);
-  }}
-}}
-
-async function refreshClients() {{
-  try {{
-    renderClients(await loadClients());
-  }} catch (e) {{
-    msg('cred-msg', 'Could not load credentials: ' + e.message, 'err');
-  }}
-}}
-
-function showSecret(clientId, secret) {{
-  document.getElementById('new-client-id').textContent = clientId;
-  document.getElementById('new-client-secret').textContent = secret;
-  document.getElementById('secret-panel').classList.remove('hidden');
-}}
-
-async function issueCredential() {{
-  const input = document.getElementById('new_okta_client_id');
-  const oktaId = input.value.trim();
-  if (!oktaId) {{
-    msg('cred-msg', 'Enter the Okta client ID of the requesting app.', 'err');
-    return;
-  }}
-  const btn = document.getElementById('issue-btn');
-  btn.disabled = true;
-  msg('cred-msg', 'Issuing…', 'ok');
-  try {{
-    const r = await fetch('/config/clients', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json', ...AUTH() }},
-      body: JSON.stringify({{ okta_client_id: oktaId }}),
-    }});
-    if (!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    showSecret(d.client_id, d.client_secret);
-    msg('cred-msg', 'Credential issued for ' + oktaId + '.', 'ok');
-    input.value = '';
-    await refreshClients();
-  }} catch (e) {{
-    msg('cred-msg', 'Issue failed: ' + e.message, 'err');
-  }} finally {{
-    btn.disabled = false;
-  }}
-}}
-
-async function rotateCredential(clientId) {{
-  msg('cred-msg', 'Rotating…', 'ok');
-  try {{
-    const r = await fetch('/config/clients/rotate', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json', ...AUTH() }},
-      body: JSON.stringify({{ client_id: clientId }}),
-    }});
-    if (!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    showSecret(d.client_id, d.client_secret);
-    msg('cred-msg', 'Rotated. The previous secret stopped working immediately.', 'ok');
-    await refreshClients();
-  }} catch (e) {{
-    msg('cred-msg', 'Rotate failed: ' + e.message, 'err');
-  }}
-}}
-
-async function revokeCredential(clientId) {{
-  msg('cred-msg', 'Revoking…', 'ok');
-  try {{
-    const r = await fetch('/config/clients/revoke', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json', ...AUTH() }},
-      body: JSON.stringify({{ client_id: clientId }}),
-    }});
-    if (!r.ok) throw new Error(await r.text());
-    msg('cred-msg', 'Revoked ' + clientId + '. The Okta app itself is untouched.', 'ok');
-    document.getElementById('secret-panel').classList.add('hidden');
-    await refreshClients();
-  }} catch (e) {{
-    msg('cred-msg', 'Revoke failed: ' + e.message, 'err');
-  }}
-}}
-
 function signOut() {{
   SS.clear();
   window.location.href = '/config';
@@ -539,11 +387,9 @@ async function showWorkload() {{
       document.getElementById('audience').value = cfg.audience || '';
       document.getElementById('idjag_issuer').value = cfg.idjag_issuer || '';
       document.getElementById('clients').value = (cfg.workload_client_ids || []).join(',');
+      document.getElementById('idjag_clients').value = (cfg.idjag_client_ids || []).join(',');
       document.getElementById('enforce').checked = !!cfg.enforce_scopes;
     }}
-    document.getElementById('token-ep-display').textContent =
-      document.getElementById('issuer-display').textContent + '/token';
-    await refreshClients();
   }} catch (e) {{
     SS.clear();
     only('domain-form');
@@ -603,28 +449,19 @@ async function main() {{
     document.getElementById('copy-btn').textContent = 'Copied';
     setTimeout(() => document.getElementById('copy-btn').textContent = 'Copy', 1500);
   }};
-  document.getElementById('copy-issuer-btn').onclick = () => {{
-    navigator.clipboard.writeText(document.getElementById('issuer-display').textContent);
-    document.getElementById('copy-issuer-btn').textContent = 'Copied';
-    setTimeout(() => document.getElementById('copy-issuer-btn').textContent = 'Copy', 1500);
-  }};
+  for (const b of document.querySelectorAll('[data-copy]')) {{
+    b.onclick = () => {{
+      navigator.clipboard.writeText(
+        document.getElementById(b.dataset.copy).textContent);
+      b.textContent = 'Copied';
+      setTimeout(() => b.textContent = 'Copy', 1500);
+    }};
+  }}
   document.getElementById('domain-form').onsubmit = onDomainSubmit;
   document.getElementById('client-form').onsubmit = onClientSubmit;
   document.getElementById('back-btn').onclick = onBack;
   document.getElementById('workload-form').onsubmit = saveWorkload;
   document.getElementById('signout-btn').onclick = signOut;
-  document.getElementById('issue-btn').onclick = issueCredential;
-  document.getElementById('dismiss-secret-btn').onclick = () =>
-    document.getElementById('secret-panel').classList.add('hidden');
-  for (const b of document.querySelectorAll('[data-copy]')) {{
-    b.onclick = () => {{
-      navigator.clipboard.writeText(
-        document.getElementById(b.dataset.copy).textContent);
-      const t = b.textContent;
-      b.textContent = 'Copied';
-      setTimeout(() => b.textContent = t, 1500);
-    }};
-  }}
 
   const url = new URL(window.location.href);
   const code = url.searchParams.get('code');
@@ -788,113 +625,9 @@ def register_config_routes(
             "audience": tenant.audience,
             "idjag_issuer": tenant.idjag_issuer,
             "workload_client_ids": tenant.workload_client_ids,
+            "idjag_client_ids": tenant.idjag_client_ids,
             "enforce_scopes": tenant.enforce_scopes,
         })
-
-    @mcp.custom_route("/config/clients", methods=["POST"])
-    async def clients_post(request: Request) -> Response:
-        """Register a workload app and issue OUR client_id + secret for it.
-
-        Body: {"okta_client_id": "0oa..."} — the Okta app that will present
-        ID-JAGs. We mint a client_id in our own namespace and bind it to that
-        app, so /token can authenticate the caller before reading the
-        assertion and then require the assertion to name this exact app.
-
-        The secret is returned once here and never again: only a salted hash
-        is persisted.
-        """
-        token = _bearer_token(request)
-        tenant = await _resolve_admin(token, store)
-        if tenant is None:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        try:
-            payload = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        okta_client_id = (payload.get("okta_client_id") or "").strip()
-        if not okta_client_id:
-            return JSONResponse({"error": "missing okta_client_id"}, status_code=400)
-
-        client_id, secret = tenant.register_client(okta_client_id)
-        try:
-            store.save(tenant)
-        except Exception as e:
-            logger.exception("SSM save failed")
-            return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
-        logger.info(
-            "Issued client_id=%s for okta_client_id=%s tenant=%s",
-            client_id, okta_client_id, tenant.okta_domain,
-        )
-        return JSONResponse(
-            {
-                "client_id": client_id,
-                "client_secret": secret,
-                "okta_client_id": okta_client_id,
-                "token_endpoint": f"{(public_base_url or '').rstrip('/')}/token",
-                "note": "Copy the secret now — it is not retrievable later.",
-            },
-            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-        )
-
-    @mcp.custom_route("/config/clients", methods=["GET"])
-    async def clients_get(request: Request) -> Response:
-        """List issued credentials. Never returns secrets."""
-        token = _bearer_token(request)
-        tenant = await _resolve_admin(token, store)
-        if tenant is None:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({
-            "clients": [
-                {
-                    "client_id": cid,
-                    "okta_client_id": rec.get("okta_client_id"),
-                    "created": rec.get("created"),
-                    "rotated": rec.get("rotated"),
-                }
-                for cid, rec in sorted(tenant.clients.items())
-            ]
-        })
-
-    @mcp.custom_route("/config/clients/rotate", methods=["POST"])
-    async def clients_rotate(request: Request) -> Response:
-        """Issue a new secret for an existing client_id, invalidating the old."""
-        token = _bearer_token(request)
-        tenant = await _resolve_admin(token, store)
-        if tenant is None:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        try:
-            payload = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        client_id = (payload.get("client_id") or "").strip()
-        secret = tenant.rotate_client_secret(client_id)
-        if secret is None:
-            return JSONResponse({"error": "unknown client_id"}, status_code=404)
-        store.save(tenant)
-        logger.info("Rotated secret for client_id=%s tenant=%s", client_id, tenant.okta_domain)
-        return JSONResponse(
-            {"client_id": client_id, "client_secret": secret,
-             "note": "Copy the secret now — it is not retrievable later."},
-            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-        )
-
-    @mcp.custom_route("/config/clients/revoke", methods=["POST"])
-    async def clients_revoke(request: Request) -> Response:
-        """Delete a credential. The Okta app itself is untouched."""
-        token = _bearer_token(request)
-        tenant = await _resolve_admin(token, store)
-        if tenant is None:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        try:
-            payload = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        client_id = (payload.get("client_id") or "").strip()
-        if not tenant.revoke_client(client_id):
-            return JSONResponse({"error": "unknown client_id"}, status_code=404)
-        store.save(tenant)
-        logger.info("Revoked client_id=%s tenant=%s", client_id, tenant.okta_domain)
-        return JSONResponse({"status": "revoked", "client_id": client_id})
 
     @mcp.custom_route("/config/workload", methods=["POST"])
     async def workload_post(request: Request) -> Response:
@@ -912,6 +645,10 @@ def register_config_routes(
         client_ids_raw = payload.get("workload_client_ids") or []
         if isinstance(client_ids_raw, str):
             client_ids_raw = [c.strip() for c in client_ids_raw.split(",")]
+        idjag_ids_raw = payload.get("idjag_client_ids") or []
+        if isinstance(idjag_ids_raw, str):
+            idjag_ids_raw = [c.strip() for c in idjag_ids_raw.split(",")]
+        idjag_ids = [c for c in idjag_ids_raw if c]
         client_ids = [c for c in client_ids_raw if c]
         if not custom_issuer or not audience:
             return JSONResponse(
@@ -935,11 +672,7 @@ def register_config_routes(
             custom_issuer=custom_issuer,
             audience=audience,
             workload_client_ids=client_ids,
-            # Carry the XAA client registry across untouched. Pruning it
-            # against workload_client_ids would mean editing the DIRECT-flow
-            # allow-list silently revokes ID-JAG credentials. Revoking is an
-            # explicit action: POST /config/clients/revoke.
-            clients=dict(tenant.clients),
+            idjag_client_ids=idjag_ids,
             enforce_scopes=bool(payload.get("enforce_scopes", False)),
             idjag_issuer=idjag_issuer,
         )

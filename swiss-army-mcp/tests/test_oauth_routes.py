@@ -52,16 +52,10 @@ async def main():
     store._by_domain = {}; store._by_workload_issuer = {}; store._by_idjag_issuer = {}
     t = Tenant(okta_domain="acme.okta.com", admin_client_id="0oaAdmin",
                custom_issuer=IDP, audience="api://default",
-               workload_client_ids=["client-abc"], idjag_issuer=IDP)
+               workload_client_ids=["direct-app"],
+               idjag_client_ids=["client-abc"], idjag_issuer=IDP)
     store._by_domain[t.okta_domain] = t
-    store._by_client_id = {}
     store._by_workload_issuer[IDP] = t; store._by_idjag_issuer[IDP] = t
-
-    # /token requires client authentication. We issue our OWN client_id and
-    # bind it to the Okta app ("client-abc") that will present ID-JAGs.
-    CID, CLIENT_SECRET = t.register_client("client-abc")
-    BASIC = "Basic " + base64.b64encode(f"{CID}:{CLIENT_SECRET}".encode()).decode()
-    store._by_client_id[CID] = t
 
     token_store = idjag.TokenStore()
     validator = idjag.IdJagValidator(store=store, expected_audience=ISSUER)
@@ -97,10 +91,10 @@ async def main():
             now = int(time.time())
             jag = make_jag(iss=IDP, sub="U123", aud=ISSUER, client_id="client-abc",
                            jti="jr1", exp=now + 300, iat=now, scope="swiss-army-mcp:text")
-            r = await client.post("/token", headers={"Authorization": BASIC}, data={
+            r = await client.post("/token", data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jag})
             tok = r.json()
-            ck("token 200 (client_secret_basic)", r.status_code == 200)
+            ck("token 200", r.status_code == 200)
             ck("token opaque + bearer", tok["token_type"] == "Bearer" and len(tok["access_token"]) > 20)
             ck("no refresh token", "refresh_token" not in tok)
             ck("scope echoed", tok["scope"] == "swiss-army-mcp:text")
@@ -127,144 +121,64 @@ async def main():
             ck("PRM root resource no trailing slash", r.json()["resource"] == f"{ISSUER}/mcp")
             ck("PRM root authz server", r.json()["authorization_servers"] == [ISSUER])
 
-            r = await client.post("/token", headers={"Authorization": BASIC},
-                                  data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer"})
+            r = await client.post("/token", data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer"})
             ck("missing assertion -> invalid_request", r.json()["error"] == "invalid_request")
 
             # bad aud -> invalid_grant
             jag2 = make_jag(iss=IDP, sub="U1", aud="https://wrong", client_id="client-abc",
                             jti="jr2", exp=now + 300, iat=now)
-            r = await client.post("/token", headers={"Authorization": BASIC}, data={
+            r = await client.post("/token", data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jag2})
             ck("bad aud -> invalid_grant 400", r.status_code == 400 and r.json()["error"] == "invalid_grant")
 
-            # ---- client authentication at /token ----
-            def jag_for(cid, jti):
-                return make_jag(iss=IDP, sub="U123", aud=ISSUER, client_id=cid,
-                                jti=jti, exp=now + 300, iat=now,
-                                scope="swiss-army-mcp:text")
-
-            # no credentials at all -> 401 invalid_client + challenge
+            # ---- XAA takes no client credentials (Okta does not issue or
+            # collect any for Cross App Access), so redemption must succeed on
+            # the assertion alone. ----
+            now2 = int(time.time())
+            jag3 = make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="client-abc",
+                            jti="na1", exp=now2 + 300, iat=now2,
+                            scope="swiss-army-mcp:text")
             r = await client.post("/token", data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-abc", "ca1")})
-            ck("no creds -> 401 invalid_client",
-               r.status_code == 401 and r.json()["error"] == "invalid_client")
-            ck("no creds -> WWW-Authenticate",
-               r.headers.get("www-authenticate", "").startswith("Basic "))
+                "assertion": jag3})
+            ck("redeems with no client credentials", r.status_code == 200)
 
-            # wrong secret -> 401 invalid_client
-            bad = "Basic " + base64.b64encode(f"{CID}:wrong".encode()).decode()
-            r = await client.post("/token", headers={"Authorization": bad}, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-abc", "ca2")})
-            ck("wrong secret -> 401 invalid_client",
-               r.status_code == 401 and r.json()["error"] == "invalid_client")
-
-            # unknown client_id -> 401 invalid_client
-            unk = "Basic " + base64.b64encode(f"samcp_nope:{CLIENT_SECRET}".encode()).decode()
-            r = await client.post("/token", headers={"Authorization": unk}, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-abc", "ca3")})
-            ck("unknown client -> 401 invalid_client",
-               r.status_code == 401 and r.json()["error"] == "invalid_client")
-
-            # client_secret_post works too
-            r = await client.post("/token", data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-abc", "ca4"),
-                "client_id": CID, "client_secret": CLIENT_SECRET})
-            ck("client_secret_post -> 200", r.status_code == 200)
-
-            # THE binding check: authenticate as client-abc, present an
-            # assertion issued to a different registered client.
-            CID2, other_secret = t.register_client("client-xyz")
-            store._by_client_id[CID2] = t
-            r = await client.post("/token", headers={"Authorization": BASIC}, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-xyz", "ca5")})
-            ck("cross-client replay -> invalid_grant",
-               r.status_code == 400 and r.json()["error"] == "invalid_grant")
-
-            # the rightful client can redeem its own assertion
-            own = "Basic " + base64.b64encode(f"{CID2}:{other_secret}".encode()).decode()
-            r = await client.post("/token", headers={"Authorization": own}, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-xyz", "ca6")})
-            ck("rightful client -> 200", r.status_code == 200)
-
-            # rotation invalidates the old secret
-            t.rotate_client_secret(CID)
-            r = await client.post("/token", headers={"Authorization": BASIC}, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-abc", "ca7")})
-            ck("rotated secret invalidates old",
-               r.status_code == 401 and r.json()["error"] == "invalid_client")
-
-            # our client_id is in OUR namespace, not Okta's
-            ck("client_id is ours", CID.startswith("samcp_") and CID != "client-abc")
-
-            # auth runs before the grant: bad creds + unparseable assertion
-            # must yield invalid_client, not invalid_grant
+            # sending credentials must not break it either — they are ignored
+            jag4 = make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="client-abc",
+                            jti="na2", exp=now2 + 300, iat=now2)
             r = await client.post("/token",
-                headers={"Authorization": "Basic " + base64.b64encode(b"samcp_x:y").decode()},
+                headers={"Authorization": "Basic " + base64.b64encode(b"x:y").decode()},
                 data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                      "assertion": "not.a.jwt"})
-            ck("auth precedes grant processing",
-               r.status_code == 401 and r.json()["error"] == "invalid_client")
+                      "assertion": jag4})
+            ck("stray credentials ignored", r.status_code == 200)
 
-            # Cross-tenant: two customers can legitimately register the same
-            # Okta client_id value. A credential issued by tenant B must not
-            # redeem an assertion that resolved to tenant A.
-            IDP_B = "https://beta.okta.com/oauth2/ausB"
-            tb = Tenant(okta_domain="beta.okta.com", admin_client_id="0oaB",
-                        custom_issuer=IDP_B, audience="api://default",
-                        workload_client_ids=["client-abc"], idjag_issuer=IDP_B)
-            CID_B, SEC_B = tb.register_client("client-abc")
-            store._by_domain[tb.okta_domain] = tb
-            store._by_idjag_issuer[IDP_B] = tb
-            store._by_client_id[CID_B] = tb
-            basic_b = "Basic " + base64.b64encode(f"{CID_B}:{SEC_B}".encode()).decode()
-            # assertion below is issued by tenant A's IdP (IDP), naming the
-            # same okta client_id, so only the tenant check can stop it
-            r = await client.post("/token", headers={"Authorization": basic_b}, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": jag_for("client-abc", "ct1")})
-            ck("cross-tenant redemption blocked",
-               r.status_code == 400 and r.json()["error"] == "invalid_grant")
+            m3 = (await client.get("/.well-known/oauth-authorization-server")).json()
+            ck("metadata advertises no client auth",
+               m3["token_endpoint_auth_methods_supported"] == ["none"])
 
-            # ---- the two flows must stay disjoint ----
-            # workload_client_ids gates the DIRECT Okta-token flow on /mcp.
-            # Registering an XAA credential must not widen it, or issuing an
-            # ID-JAG credential would silently grant direct /mcp access.
+            # ---- the two modes share nothing but scopes ----
             td = Tenant(okta_domain="d.okta.com", admin_client_id="0oaD",
                         custom_issuer=IDP, audience="api://default",
-                        workload_client_ids=["direct-only-app"])
-            before = list(td.workload_client_ids)
-            xcid, _ = td.register_client("xaa-only-app")
-            ck("register does not widen direct flow",
-               td.workload_client_ids == before)
-            ck("xaa app absent from direct allow-list",
-               "xaa-only-app" not in td.workload_client_ids)
-            ck("xaa allow-list comes from the registry",
-               td.idjag_client_ids == ["xaa-only-app"])
-            ck("direct-only app cannot redeem ID-JAGs",
-               "direct-only-app" not in td.idjag_client_ids)
-            # revoking the credential empties the XAA list without touching
-            # the direct one
-            td.revoke_client(xcid)
-            ck("revoke leaves direct flow intact",
-               td.workload_client_ids == before)
-            # with no credential issued the XAA list is empty — it must NOT
-            # fall back to mode 1's allow-list. The modes share only scopes.
-            ck("empty registry does not borrow mode 1's list",
-               td.idjag_client_ids == [])
+                        workload_client_ids=["direct-only"],
+                        idjag_client_ids=["xaa-only"])
+            ck("mode 1 list is its own", td.workload_client_ids == ["direct-only"])
+            ck("mode 2 list is its own", td.idjag_client_ids == ["xaa-only"])
+            ck("mode 2 does not see mode 1's apps",
+               "direct-only" not in td.idjag_client_ids)
+            ck("mode 1 does not see mode 2's apps",
+               "xaa-only" not in td.workload_client_ids)
+            ck("both survive SSM round-trip",
+               Tenant.from_json(td.to_json()).idjag_client_ids == ["xaa-only"]
+               and Tenant.from_json(td.to_json()).workload_client_ids == ["direct-only"])
 
-            # metadata advertises the real auth methods
-            m2 = (await client.get("/.well-known/oauth-authorization-server")).json()
-            ck("metadata advertises client auth",
-               m2["token_endpoint_auth_methods_supported"] ==
-               ["client_secret_basic", "client_secret_post"])
+            # an ID-JAG from a client only on mode 1's list must be rejected
+            jag5 = make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="direct-app",
+                            jti="na3", exp=now2 + 300, iat=now2)
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag5})
+            ck("mode 1 app cannot redeem an ID-JAG",
+               r.status_code == 400 and r.json()["error"] == "invalid_grant")
 
     nf = sum(1 for _, c in results if not c)
     print(f"\n{len(results)-nf}/{len(results)} passed")

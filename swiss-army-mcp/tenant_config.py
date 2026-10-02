@@ -13,83 +13,17 @@ Configuration:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import os
-import secrets
 import threading
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Client registry
-#
-# swiss-army-mcp is an authorization server in its own right (RFC 8414
-# metadata, /token, it mints access tokens), so it keeps its own client
-# registry rather than borrowing Okta's identifiers. Registering a workload
-# issues a NEW client_id of ours plus a secret, and records which Okta
-# client_id that credential speaks for.
-#
-# Two reasons this matters beyond tidiness:
-#   * Our client_id is globally unique, so /token can authenticate the caller
-#     *before* touching the assertion — RFC 6749 §5.2 order. Keying on Okta's
-#     client_id forced us to validate the assertion first just to learn which
-#     tenant's secret to check.
-#   * The same Okta app registered in two orgs is distinguishable here, and
-#     revoking our credential never touches anything in Okta.
-#
-# Secrets are shown to the admin exactly once and persisted only as a salted
-# SHA-256 hash: the tenant blob is a plain SSM ``String`` (see
-# TenantStore.save), so anything with ssm:GetParameter on the prefix can read
-# it, and a hash keeps a leaked parameter from yielding usable credentials.
-# Plain SHA-256 is adequate because the secret is 256 bits of os.urandom, not
-# a human-chosen password.
-# ---------------------------------------------------------------------------
-
-_SECRET_SCHEME = "sha256"
-CLIENT_ID_PREFIX = "samcp_"
-
-
-def generate_client_id() -> str:
-    """A client_id in our own namespace, unique across all tenants."""
-    return CLIENT_ID_PREFIX + secrets.token_urlsafe(16)
-
-
-def generate_client_secret() -> str:
-    """A fresh 256-bit client secret, URL-safe. Shown once, never stored."""
-    return secrets.token_urlsafe(32)
-
-
-def hash_client_secret(secret: str, *, salt: bytes | None = None) -> str:
-    """Encode as ``sha256$<salt_hex>$<digest_hex>``."""
-    salt = salt if salt is not None else secrets.token_bytes(16)
-    digest = hashlib.sha256(salt + secret.encode()).hexdigest()
-    return f"{_SECRET_SCHEME}${salt.hex()}${digest}"
-
-
-def verify_client_secret(secret: str, stored: str) -> bool:
-    """Constant-time check of ``secret`` against a stored hash."""
-    try:
-        scheme, salt_hex, digest_hex = stored.split("$", 2)
-    except ValueError:
-        return False
-    if scheme != _SECRET_SCHEME:
-        return False
-    try:
-        salt = bytes.fromhex(salt_hex)
-    except ValueError:
-        return False
-    expected = hashlib.sha256(salt + secret.encode()).hexdigest()
-    return hmac.compare_digest(expected, digest_hex)
 
 
 @dataclass
@@ -100,12 +34,14 @@ class Tenant:
     admin_client_id: str
     custom_issuer: str | None = None
     audience: str | None = None
+    # Mode 1 (direct Okta access tokens on /mcp): Okta apps whose tokens are
+    # accepted, matched against the `cid` claim.
     workload_client_ids: list[str] = field(default_factory=list)
-    # Our client_id -> {"secret": <salted hash>, "okta_client_id": str,
-    # "created": iso8601}. Credentials we issued; the key is in our namespace,
-    # not Okta's. A workload with no entry here cannot redeem an ID-JAG, since
-    # /token requires client authentication for every tenant.
-    clients: dict[str, dict] = field(default_factory=dict)
+    # Mode 2 (ID-JAG redeemed at /token): Okta apps permitted to redeem an
+    # assertion, matched against the ID-JAG's `client_id` claim. Separate from
+    # workload_client_ids on purpose — the two modes share nothing but scopes,
+    # so neither list may widen the other. Empty means allow any client_id.
+    idjag_client_ids: list[str] = field(default_factory=list)
     enforce_scopes: bool = False
     # Okta authorization-server URL that mints ID-JAG assertions (Cross-App
     # Access) for this customer. Often the same as ``custom_issuer``, but kept
@@ -113,69 +49,6 @@ class Tenant:
     # set, ID-JAGs whose ``iss`` matches this value are dispatched to this
     # tenant. See ``idjag.py``.
     idjag_issuer: str | None = None
-
-    def register_client(self, okta_client_id: str) -> tuple[str, str]:
-        """Issue a new (client_id, secret) pair for an Okta workload app.
-
-        Returns our generated client_id and the plaintext secret. The secret is
-        only ever returned here — storage keeps a salted hash.
-        """
-        client_id = generate_client_id()
-        secret = generate_client_secret()
-        self.clients[client_id] = {
-            "secret": hash_client_secret(secret),
-            "okta_client_id": okta_client_id,
-            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-        # Deliberately does NOT touch workload_client_ids. That list is the
-        # allow-list for the DIRECT Okta-token flow on /mcp (see
-        # okta_auth.build_workload_verifier), so appending here would let
-        # registering an XAA credential silently widen direct access. The two
-        # flows stay disjoint: `clients` governs ID-JAG redemption only.
-        return client_id, secret
-
-    def rotate_client_secret(self, client_id: str) -> str | None:
-        """Replace one client's secret, keeping its client_id and mapping."""
-        rec = self.clients.get(client_id)
-        if rec is None:
-            return None
-        secret = generate_client_secret()
-        rec["secret"] = hash_client_secret(secret)
-        rec["rotated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        return secret
-
-    def revoke_client(self, client_id: str) -> bool:
-        """Delete a credential. The Okta app is untouched."""
-        return self.clients.pop(client_id, None) is not None
-
-    def authenticate_client(self, client_id: str, secret: str) -> dict | None:
-        """Return the client record when the secret matches, else None."""
-        if not client_id or not secret:
-            return None
-        rec = self.clients.get(client_id)
-        if not rec:
-            return None
-        if not verify_client_secret(secret, rec.get("secret") or ""):
-            return None
-        return rec
-
-    @property
-    def idjag_client_ids(self) -> list[str]:
-        """Okta apps permitted to redeem ID-JAGs (mode 2), from our registry.
-
-        Deliberately has NO fallback to workload_client_ids: that field belongs
-        to mode 1 (direct Okta access tokens on /mcp) and the two modes share
-        nothing but scopes. Reading it here would make mode 2's behaviour
-        depend on mode 1's configuration.
-
-        An empty list means no credential has been issued, in which case
-        /token's client-authentication gate already rejected the caller before
-        this is consulted.
-        """
-        return [
-            rec.get("okta_client_id") for rec in self.clients.values()
-            if rec.get("okta_client_id")
-        ]
 
     @property
     def has_workload_config(self) -> bool:
@@ -198,7 +71,7 @@ class Tenant:
             custom_issuer=d.get("custom_issuer") or None,
             audience=d.get("audience") or None,
             workload_client_ids=list(d.get("workload_client_ids") or []),
-            clients=dict(d.get("clients") or {}),
+            idjag_client_ids=list(d.get("idjag_client_ids") or []),
             enforce_scopes=bool(d.get("enforce_scopes", False)),
             idjag_issuer=d.get("idjag_issuer") or None,
         )
@@ -223,9 +96,6 @@ class TenantStore:
         self._by_domain: dict[str, Tenant] = {}
         self._by_workload_issuer: dict[str, Tenant] = {}
         self._by_idjag_issuer: dict[str, Tenant] = {}
-        # Our client_id -> owning tenant. Globally unique because we generate
-        # the ids, which lets /token authenticate before reading the assertion.
-        self._by_client_id: dict[str, Tenant] = {}
 
     # ------------------------------------------------------------------
     # Hydration / lookup
@@ -249,14 +119,9 @@ class TenantStore:
             self._by_idjag_issuer = {
                 t.idjag_issuer: t for t in loaded if t.idjag_issuer
             }
-            self._by_client_id = {
-                cid: t for t in loaded for cid in t.clients
-            }
         logger.info(
-            "Hydrated %d tenant(s) from %s; %d have workload config, "
-            "%d registered client(s)",
+            "Hydrated %d tenant(s) from %s; %d have workload config",
             len(loaded), self.prefix, len(self._by_workload_issuer),
-            len(self._by_client_id),
         )
 
     def get(self, domain: str) -> Tenant | None:
@@ -291,17 +156,6 @@ class TenantStore:
                     return t
         return None
 
-    def find_client(self, client_id: str) -> tuple[Tenant, dict] | None:
-        """Resolve one of our client_ids to its tenant and record."""
-        with self._lock:
-            tenant = self._by_client_id.get(client_id)
-        if tenant is None:
-            return None
-        rec = tenant.clients.get(client_id)
-        if rec is None:
-            return None
-        return tenant, rec
-
     def all(self) -> list[Tenant]:
         with self._lock:
             return list(self._by_domain.values())
@@ -329,15 +183,7 @@ class TenantStore:
             if old and old.idjag_issuer and old.idjag_issuer in self._by_idjag_issuer:
                 if self._by_idjag_issuer.get(old.idjag_issuer) is old:
                     del self._by_idjag_issuer[old.idjag_issuer]
-            if old:
-                # Drop every client_id the previous revision owned, so revoked
-                # credentials stop resolving immediately.
-                for cid in list(self._by_client_id):
-                    if self._by_client_id.get(cid) is old:
-                        del self._by_client_id[cid]
             self._by_domain[tenant.okta_domain.lower()] = tenant
-            for cid in tenant.clients:
-                self._by_client_id[cid] = tenant
             if tenant.custom_issuer:
                 self._by_workload_issuer[tenant.custom_issuer] = tenant
             if tenant.idjag_issuer:
