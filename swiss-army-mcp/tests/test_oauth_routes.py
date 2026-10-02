@@ -150,11 +150,73 @@ async def main():
                 headers={"Authorization": "Basic " + base64.b64encode(b"x:y").decode()},
                 data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
                       "assertion": jag4})
-            ck("stray credentials ignored", r.status_code == 200)
+            ck("bogus credentials are rejected, not ignored",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
 
             m3 = (await client.get("/.well-known/oauth-authorization-server")).json()
-            ck("metadata advertises no client auth",
-               m3["token_endpoint_auth_methods_supported"] == ["none"])
+            ck("metadata advertises optional client auth",
+               m3["token_endpoint_auth_methods_supported"] ==
+               ["client_secret_basic", "client_secret_post", "none"])
+
+            # ---- Brokered Consent: credentials we generate, no input ----
+            RC_ID, RC_SECRET = t.issue_resource_credentials()
+            ck("client_id generated without input", RC_ID.startswith("samcp_"))
+            ck("client_id redisplayable", t.resource_client_id == RC_ID)
+            ck("secret not stored in the clear", RC_SECRET not in t.to_json())
+            ck("credential survives SSM round-trip",
+               Tenant.from_json(t.to_json()).verify_resource_client(RC_ID, RC_SECRET))
+
+            rc_basic = "Basic " + base64.b64encode(f"{RC_ID}:{RC_SECRET}".encode()).decode()
+            def jg(jti):
+                return make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="client-abc",
+                                jti=jti, exp=now2 + 300, iat=now2)
+
+            r = await client.post("/token", headers={"Authorization": rc_basic}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc1")})
+            ck("valid credentials -> 200", r.status_code == 200)
+
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc2"),
+                "client_id": RC_ID, "client_secret": RC_SECRET})
+            ck("client_secret_post -> 200", r.status_code == 200)
+
+            bad = "Basic " + base64.b64encode(f"{RC_ID}:wrong".encode()).decode()
+            r = await client.post("/token", headers={"Authorization": bad}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc3")})
+            ck("wrong secret -> 401 invalid_client",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+
+            # XAA still works with the credential on file
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc4")})
+            ck("XAA still assertion-only", r.status_code == 200)
+
+            # rotation keeps the client_id, kills the old secret
+            RC_ID2, RC_SECRET2 = t.issue_resource_credentials()
+            ck("rotation keeps client_id", RC_ID2 == RC_ID)
+            r = await client.post("/token", headers={"Authorization": rc_basic}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc5")})
+            ck("rotated secret invalidates old",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+
+            # require_client_auth makes it mandatory for that tenant
+            t.require_client_auth = True
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc6")})
+            ck("require_client_auth rejects assertion-only",
+               r.status_code == 401 and r.json()["error"] == "invalid_client")
+            ok2 = "Basic " + base64.b64encode(f"{RC_ID}:{RC_SECRET2}".encode()).decode()
+            r = await client.post("/token", headers={"Authorization": ok2}, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jg("bc7")})
+            ck("require_client_auth accepts valid creds", r.status_code == 200)
+            t.require_client_auth = False
 
             # ---- the two modes share nothing but scopes ----
             td = Tenant(okta_domain="d.okta.com", admin_client_id="0oaD",

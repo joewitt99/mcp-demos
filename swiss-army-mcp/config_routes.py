@@ -30,7 +30,7 @@ from okta_auth import (
     domain_from_issuer,
     peek_jwt_claims,
 )
-from scopes import TOOL_PREFIX_TO_SCOPE, WILDCARD_SCOPE
+from scopes import ALL_SCOPES, TOOL_PREFIX_TO_SCOPE, WILDCARD_SCOPE
 from tenant_config import Tenant, TenantStore
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 
 def _html(redirect_uri: str, issuer: str | None = None) -> str:
+    scope_list = " ".join(ALL_SCOPES)
     scope_rows = "\n          ".join(
         f"<tr><td><code>{prefix}*</code></td><td><code>{scope}</code></td></tr>"
         for prefix, scope in TOOL_PREFIX_TO_SCOPE.items()
@@ -96,6 +97,14 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     .xaa-section h2 {{ font-size: 1.1rem; margin: 0 0 0.35rem; }}
     .xaa-field {{ margin-top: 0.9rem; }}
     .xaa-field .xaa-label {{ font-weight: 500; font-size: 0.85rem; margin-bottom: 0.25rem; }}
+    .secret-panel {{ background: #fff8e1; border: 1px solid #f0c948; border-radius: 6px;
+                     padding: 1rem; margin-top: 1rem; }}
+    .secret-panel .warn {{ color: #6b4f00; font-weight: 600; font-size: 0.85rem;
+                           margin-bottom: 0.75rem; }}
+    .secret-panel .xaa-label {{ margin-top: 0.75rem; }}
+    .method-note {{ background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 6px;
+                    padding: 0.6rem 0.85rem; font-size: 0.82rem; color: #444;
+                    margin: 0.75rem 0 0; }}
   </style>
 </head>
 <body>
@@ -180,6 +189,58 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
         <div class="hint">This server requires the ID-JAG's <code>aud</code> to equal
           this value exactly &mdash; no path, no trailing slash.</div>
       </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Scopes</div>
+        <div class="redirect-box">
+          <code id="xaa-scopes">{scope_list}</code>
+          <button type="button" class="copy-btn secondary" data-copy="xaa-scopes">Copy</button>
+        </div>
+      </div>
+
+      <div class="method-note">
+        <strong>Which Okta access method?</strong> <em>Cross App Access</em> needs only
+        the Resource URL, Issuer URL and Audience above &mdash; no credentials.
+        <em>Brokered Consent</em> (and the generic resource server form) also asks for a
+        Client ID, Client secret and Scopes: generate them below.
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Client ID</div>
+        <div class="redirect-box">
+          <code id="rc-client-id">(not generated yet)</code>
+          <button type="button" class="copy-btn secondary" data-copy="rc-client-id">Copy</button>
+        </div>
+        <div class="hint" id="rc-meta"></div>
+      </div>
+
+      <button id="gen-creds-btn" type="button">Generate client secret</button>
+      <div id="rc-msg" class="msg hidden"></div>
+
+      <div id="rc-panel" class="secret-panel hidden">
+        <div class="warn">&#9888; Copy the secret now &mdash; it is hashed on save and
+          cannot be shown again. Generating again rotates it and invalidates the old one.</div>
+        <div class="xaa-label">Client ID</div>
+        <div class="redirect-box">
+          <code id="rc-new-id"></code>
+          <button type="button" class="copy-btn secondary" data-copy="rc-new-id">Copy</button>
+        </div>
+        <div class="xaa-label">Client secret</div>
+        <div class="redirect-box">
+          <code id="rc-new-secret"></code>
+          <button type="button" class="copy-btn secondary" data-copy="rc-new-secret">Copy</button>
+        </div>
+        <button type="button" class="secondary" id="rc-dismiss-btn">Done</button>
+      </div>
+
+      <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 1.25rem;">
+        <input id="require_client_auth" type="checkbox" style="width: auto;">
+        Require client authentication at <code>/token</code>
+      </label>
+      <div class="hint">Leave <strong>off</strong> for Cross App Access, which presents no
+        credentials. Turn on only if every caller uses Brokered Consent &mdash; with it on,
+        an assertion-only redemption is rejected. Credentials are always validated when
+        presented, either way.</div>
 
       <label for="idjag_clients">ID-JAG client IDs (optional, comma-separated)</label>
       <input id="idjag_clients" type="text" placeholder="0oaXXXX...,0oaYYYY...">
@@ -352,6 +413,7 @@ async function saveWorkload(ev) {{
       .split(',').map(s => s.trim()).filter(Boolean),
     idjag_client_ids: document.getElementById('idjag_clients').value
       .split(',').map(s => s.trim()).filter(Boolean),
+    require_client_auth: document.getElementById('require_client_auth').checked,
     enforce_scopes: document.getElementById('enforce').checked,
   }};
   try {{
@@ -372,6 +434,48 @@ async function saveWorkload(ev) {{
   }}
 }}
 
+async function generateCredentials() {{
+  const btn = document.getElementById('gen-creds-btn');
+  btn.disabled = true;
+  msg('rc-msg', 'Generating…', 'ok');
+  try {{
+    const r = await fetch('/config/resource-credentials', {{
+      method: 'POST',
+      headers: {{ Authorization: 'Bearer ' + SS.getItem('access_token') }},
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    document.getElementById('rc-new-id').textContent = d.client_id;
+    document.getElementById('rc-new-secret').textContent = d.client_secret;
+    document.getElementById('rc-panel').classList.remove('hidden');
+    document.getElementById('rc-client-id').textContent = d.client_id;
+    msg('rc-msg', d.rotated
+      ? 'Secret rotated. The previous one stopped working immediately.'
+      : 'Credentials generated.', 'ok');
+  }} catch (e) {{
+    msg('rc-msg', 'Failed: ' + e.message, 'err');
+  }} finally {{
+    btn.disabled = false;
+  }}
+}}
+
+function renderResourceClient(cfg) {{
+  const idEl = document.getElementById('rc-client-id');
+  const meta = document.getElementById('rc-meta');
+  const btn = document.getElementById('gen-creds-btn');
+  if (cfg && cfg.resource_client_id) {{
+    idEl.textContent = cfg.resource_client_id;
+    meta.textContent = 'Issued ' + (cfg.resource_client_created || 'unknown') +
+      (cfg.resource_client_rotated ? ' \u00b7 rotated ' + cfg.resource_client_rotated : '') +
+      ' \u00b7 the secret is not recoverable; generate again to rotate it.';
+    btn.textContent = 'Rotate client secret';
+  }} else {{
+    idEl.textContent = '(not generated yet)';
+    meta.textContent = 'No credential yet. Generate one if Okta asks for a Client ID and secret.';
+    btn.textContent = 'Generate client secret';
+  }}
+}}
+
 function signOut() {{
   SS.clear();
   window.location.href = '/config';
@@ -388,6 +492,7 @@ async function showWorkload() {{
       document.getElementById('idjag_issuer').value = cfg.idjag_issuer || '';
       document.getElementById('clients').value = (cfg.workload_client_ids || []).join(',');
       document.getElementById('idjag_clients').value = (cfg.idjag_client_ids || []).join(',');
+      document.getElementById('require_client_auth').checked = !!cfg.require_client_auth;
       document.getElementById('enforce').checked = !!cfg.enforce_scopes;
     }}
   }} catch (e) {{
@@ -462,6 +567,9 @@ async function main() {{
   document.getElementById('back-btn').onclick = onBack;
   document.getElementById('workload-form').onsubmit = saveWorkload;
   document.getElementById('signout-btn').onclick = signOut;
+  document.getElementById('gen-creds-btn').onclick = generateCredentials;
+  document.getElementById('rc-dismiss-btn').onclick = () =>
+    document.getElementById('rc-panel').classList.add('hidden');
 
   const url = new URL(window.location.href);
   const code = url.searchParams.get('code');
@@ -626,8 +734,42 @@ def register_config_routes(
             "idjag_issuer": tenant.idjag_issuer,
             "workload_client_ids": tenant.workload_client_ids,
             "idjag_client_ids": tenant.idjag_client_ids,
+            "require_client_auth": tenant.require_client_auth,
+            "resource_client_id": tenant.resource_client_id,
+            "resource_client_created": tenant.resource_client.get("created"),
+            "resource_client_rotated": tenant.resource_client.get("rotated"),
             "enforce_scopes": tenant.enforce_scopes,
         })
+
+    @mcp.custom_route("/config/resource-credentials", methods=["POST"])
+    async def resource_credentials_post(request: Request) -> Response:
+        """Generate or rotate this tenant's resource-server credential.
+
+        Takes no body — Okta gives the admin nothing to supply at registration
+        time. The client_id is stable across rotations so a value already
+        pasted into Okta keeps working; only the secret changes. The plaintext
+        is returned once and never stored.
+        """
+        token = _bearer_token(request)
+        tenant = await _resolve_admin(token, store)
+        if tenant is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        rotated = bool(tenant.resource_client_id)
+        client_id, secret = tenant.issue_resource_credentials()
+        try:
+            store.save(tenant)
+        except Exception as e:
+            logger.exception("SSM save failed")
+            return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
+        logger.info(
+            "%s resource credential for tenant %s (client_id=%s)",
+            "Rotated" if rotated else "Issued", tenant.okta_domain, client_id,
+        )
+        return JSONResponse(
+            {"client_id": client_id, "client_secret": secret, "rotated": rotated,
+             "note": "Copy the secret now — it is not retrievable later."},
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     @mcp.custom_route("/config/workload", methods=["POST"])
     async def workload_post(request: Request) -> Response:
@@ -673,6 +815,10 @@ def register_config_routes(
             audience=audience,
             workload_client_ids=client_ids,
             idjag_client_ids=idjag_ids,
+            # Carry the credential across the rewrite — losing it would
+            # invalidate the secret already pasted into Okta.
+            resource_client=dict(tenant.resource_client),
+            require_client_auth=bool(payload.get("require_client_auth", False)),
             enforce_scopes=bool(payload.get("enforce_scopes", False)),
             idjag_issuer=idjag_issuer,
         )

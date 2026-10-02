@@ -15,8 +15,10 @@ Routes registered here:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -35,6 +37,41 @@ from tenant_config import TenantStore
 logger = logging.getLogger(__name__)
 
 _NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
+def _invalid_client(description: str) -> JSONResponse:
+    """RFC 6749 §5.2: invalid_client is 401 and carries a challenge."""
+    return JSONResponse(
+        {"error": "invalid_client", "error_description": description},
+        status_code=401,
+        headers={**_NO_STORE, "WWW-Authenticate": 'Basic realm="token"'},
+    )
+
+
+def _parse_client_auth(request: Request, form) -> tuple[str, str, str] | None:
+    """Extract client credentials, preferring Basic over form parameters.
+
+    Returns (client_id, secret, method), or None when the request presents
+    none — which is the normal case for pure XAA. Per RFC 6749 §2.3.1 the
+    Basic userid/password are form-urlencoded before base64, so they are
+    unquoted after splitting.
+    """
+    header = request.headers.get("authorization") or ""
+    if header[:6].lower() == "basic ":
+        try:
+            raw = base64.b64decode(header[6:].strip(), validate=True).decode()
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return None
+        if ":" not in raw:
+            return None
+        cid, _, sec = raw.partition(":")
+        return unquote(cid), unquote(sec), "client_secret_basic"
+
+    cid = (form.get("client_id") or "").strip()
+    sec = (form.get("client_secret") or "").strip()
+    if cid and sec:
+        return cid, sec, "client_secret_post"
+    return None
 
 
 def _oauth_error(error: str, description: str, status: int = 400) -> JSONResponse:
@@ -75,7 +112,13 @@ def register_oauth_routes(
             "grant_types_supported": [JWT_BEARER_GRANT],
             "authorization_grant_profiles_supported": [ID_JAG_GRANT_PROFILE],
             "response_types_supported": [],
-            "token_endpoint_auth_methods_supported": ["none"],
+            "token_endpoint_auth_methods_supported": [
+                # Brokered Consent registrations authenticate; pure XAA sends
+                # nothing, so "none" is advertised alongside.
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ],
             "scopes_supported": ALL_SCOPES,
             "code_challenge_methods_supported": ["S256"],
         })
@@ -149,6 +192,32 @@ def register_oauth_routes(
                 peek.get("sub"), peek.get("client_id"), peek.get("exp"),
             )
             return _oauth_error(e.oauth_error, e.description)
+
+        # Client authentication is OPTIONAL here. Okta's Brokered Consent
+        # registration supplies a client_id/secret, while pure XAA sends none,
+        # so we verify whatever is presented and only *require* it when the
+        # tenant asks. Checked after validation because the assertion is what
+        # identifies the tenant whose credential applies.
+        tenant = store.get(claims.tenant_domain)
+        creds = _parse_client_auth(request, form)
+        if creds is not None:
+            cid, secret, method = creds
+            if tenant is None or not tenant.verify_resource_client(cid, secret):
+                logger.warning(
+                    "Client auth failed at /token (method=%s) client_id=%r tenant=%s",
+                    method, cid, claims.tenant_domain,
+                )
+                return _invalid_client("client authentication failed")
+        elif tenant is not None and tenant.require_client_auth:
+            logger.warning(
+                "Tenant %s requires client auth but none was presented",
+                claims.tenant_domain,
+            )
+            return _invalid_client(
+                "this tenant requires client authentication: use HTTP Basic "
+                "(client_secret_basic) or client_id/client_secret form "
+                "parameters (client_secret_post)"
+            )
 
         # Optional down-scoping: a requested 'scope' may only narrow, not widen.
         granted = list(claims.scopes)
