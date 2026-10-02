@@ -88,6 +88,21 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     details.scope-ref table {{ width: 100%; border-collapse: collapse; margin-top: 0.25rem; }}
     details.scope-ref th, details.scope-ref td {{ padding: 0.3rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }}
     details.scope-ref th {{ font-weight: 600; color: #444; background: #fafafa; }}
+    .cred-section {{ margin-top: 3rem; padding-top: 2rem; border-top: 2px solid #e5e5e5; }}
+    .cred-section h2 {{ font-size: 1.15rem; margin: 0 0 0.5rem; }}
+    .cred-row {{ display: flex; gap: 0.5rem; align-items: flex-start;
+                 padding: 0.6rem 0; border-bottom: 1px solid #eee; font-size: 0.85rem; }}
+    .cred-row .cred-meta {{ flex: 1; min-width: 0; }}
+    .cred-row code {{ word-break: break-all; }}
+    .cred-row .cred-sub {{ color: #777; font-size: 0.8rem; margin-top: 0.2rem; }}
+    .cred-row button {{ margin: 0; padding: 0.3rem 0.7rem; font-size: 0.8rem; }}
+    .cred-row button.danger {{ background: #a62121; }}
+    .secret-panel {{ background: #fff8e1; border: 1px solid #f0c948;
+                     border-radius: 6px; padding: 1rem; margin-top: 1rem; }}
+    .secret-panel .warn {{ color: #6b4f00; font-weight: 600; margin-bottom: 0.75rem;
+                           font-size: 0.85rem; }}
+    .secret-panel label {{ margin-top: 0.75rem; font-size: 0.8rem; }}
+    .empty-note {{ color: #777; font-size: 0.85rem; padding: 0.75rem 0; }}
   </style>
 </head>
 <body>
@@ -196,6 +211,44 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     <button id="save-btn" type="submit">Save configuration</button>
     <button id="signout-btn" class="secondary" type="button">Sign out</button>
     <div id="workload-msg" class="msg hidden"></div>
+
+    <!-- Step 4: XAA client credentials -->
+    <div class="cred-section">
+      <h2>Cross-App-Access client credentials</h2>
+      <div class="subtle" style="margin-bottom: 1rem;">
+        Each app that redeems an ID-JAG at <code id="token-ep-display"></code>
+        needs a credential issued here. This is separate from the app's Okta
+        client secret: that one authenticates to Okta to mint the assertion,
+        this one authenticates to this server to redeem it.
+      </div>
+
+      <label for="new_okta_client_id">Okta client ID of the requesting app</label>
+      <input id="new_okta_client_id" type="text" placeholder="0oa..." autocomplete="off">
+      <div class="hint">The app performing the Cross-App-Access token exchange.
+        Issuing a credential here does <strong>not</strong> grant it direct
+        <code>/mcp</code> access &mdash; that is the Workload client IDs field above.</div>
+      <button id="issue-btn" type="button">Issue credential</button>
+      <div id="cred-msg" class="msg hidden"></div>
+
+      <div id="secret-panel" class="secret-panel hidden">
+        <div class="warn">&#9888; Copy the secret now &mdash; it is hashed on save and
+          cannot be shown again.</div>
+        <label>Client ID</label>
+        <div class="redirect-box">
+          <code id="new-client-id"></code>
+          <button type="button" class="copy-btn secondary" data-copy="new-client-id">Copy</button>
+        </div>
+        <label>Client secret</label>
+        <div class="redirect-box">
+          <code id="new-client-secret"></code>
+          <button type="button" class="copy-btn secondary" data-copy="new-client-secret">Copy</button>
+        </div>
+        <button type="button" class="secondary" id="dismiss-secret-btn">Done</button>
+      </div>
+
+      <h2 style="margin-top: 2rem; font-size: 1rem;">Issued credentials</h2>
+      <div id="cred-list"></div>
+    </div>
   </form>
 
 <script>
@@ -330,6 +383,147 @@ async function saveWorkload(ev) {{
   }}
 }}
 
+const AUTH = () => ({{ Authorization: 'Bearer ' + SS.getItem('access_token') }});
+
+async function loadClients() {{
+  const r = await fetch('/config/clients', {{ headers: AUTH() }});
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()).clients || [];
+}}
+
+function renderClients(list) {{
+  const box = document.getElementById('cred-list');
+  box.textContent = '';
+  if (!list.length) {{
+    const d = document.createElement('div');
+    d.className = 'empty-note';
+    d.textContent = 'No credentials issued yet. Without one, no app can redeem an ID-JAG.';
+    box.appendChild(d);
+    return;
+  }}
+  for (const c of list) {{
+    const row = document.createElement('div');
+    row.className = 'cred-row';
+
+    const meta = document.createElement('div');
+    meta.className = 'cred-meta';
+    const cid = document.createElement('code');
+    cid.textContent = c.client_id;
+    meta.appendChild(cid);
+    const sub = document.createElement('div');
+    sub.className = 'cred-sub';
+    sub.textContent = 'for Okta app ' + (c.okta_client_id || '(none)') +
+      (c.created ? ' \u00b7 issued ' + c.created : '') +
+      (c.rotated ? ' \u00b7 rotated ' + c.rotated : '');
+    meta.appendChild(sub);
+    row.appendChild(meta);
+
+    const rot = document.createElement('button');
+    rot.type = 'button';
+    rot.className = 'secondary';
+    rot.textContent = 'Rotate';
+    rot.onclick = () => rotateCredential(c.client_id);
+    row.appendChild(rot);
+
+    // Two-step revoke: no browser confirm() dialog, and no accidental deletes.
+    const rev = document.createElement('button');
+    rev.type = 'button';
+    rev.className = 'danger';
+    rev.textContent = 'Revoke';
+    rev.dataset.armed = '';
+    rev.onclick = () => {{
+      if (!rev.dataset.armed) {{
+        rev.dataset.armed = '1';
+        rev.textContent = 'Confirm?';
+        setTimeout(() => {{ rev.dataset.armed = ''; rev.textContent = 'Revoke'; }}, 4000);
+        return;
+      }}
+      revokeCredential(c.client_id);
+    }};
+    row.appendChild(rev);
+
+    box.appendChild(row);
+  }}
+}}
+
+async function refreshClients() {{
+  try {{
+    renderClients(await loadClients());
+  }} catch (e) {{
+    msg('cred-msg', 'Could not load credentials: ' + e.message, 'err');
+  }}
+}}
+
+function showSecret(clientId, secret) {{
+  document.getElementById('new-client-id').textContent = clientId;
+  document.getElementById('new-client-secret').textContent = secret;
+  document.getElementById('secret-panel').classList.remove('hidden');
+}}
+
+async function issueCredential() {{
+  const input = document.getElementById('new_okta_client_id');
+  const oktaId = input.value.trim();
+  if (!oktaId) {{
+    msg('cred-msg', 'Enter the Okta client ID of the requesting app.', 'err');
+    return;
+  }}
+  const btn = document.getElementById('issue-btn');
+  btn.disabled = true;
+  msg('cred-msg', 'Issuing…', 'ok');
+  try {{
+    const r = await fetch('/config/clients', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', ...AUTH() }},
+      body: JSON.stringify({{ okta_client_id: oktaId }}),
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    showSecret(d.client_id, d.client_secret);
+    msg('cred-msg', 'Credential issued for ' + oktaId + '.', 'ok');
+    input.value = '';
+    await refreshClients();
+  }} catch (e) {{
+    msg('cred-msg', 'Issue failed: ' + e.message, 'err');
+  }} finally {{
+    btn.disabled = false;
+  }}
+}}
+
+async function rotateCredential(clientId) {{
+  msg('cred-msg', 'Rotating…', 'ok');
+  try {{
+    const r = await fetch('/config/clients/rotate', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', ...AUTH() }},
+      body: JSON.stringify({{ client_id: clientId }}),
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    showSecret(d.client_id, d.client_secret);
+    msg('cred-msg', 'Rotated. The previous secret stopped working immediately.', 'ok');
+    await refreshClients();
+  }} catch (e) {{
+    msg('cred-msg', 'Rotate failed: ' + e.message, 'err');
+  }}
+}}
+
+async function revokeCredential(clientId) {{
+  msg('cred-msg', 'Revoking…', 'ok');
+  try {{
+    const r = await fetch('/config/clients/revoke', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json', ...AUTH() }},
+      body: JSON.stringify({{ client_id: clientId }}),
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    msg('cred-msg', 'Revoked ' + clientId + '. The Okta app itself is untouched.', 'ok');
+    document.getElementById('secret-panel').classList.add('hidden');
+    await refreshClients();
+  }} catch (e) {{
+    msg('cred-msg', 'Revoke failed: ' + e.message, 'err');
+  }}
+}}
+
 function signOut() {{
   SS.clear();
   window.location.href = '/config';
@@ -347,6 +541,9 @@ async function showWorkload() {{
       document.getElementById('clients').value = (cfg.workload_client_ids || []).join(',');
       document.getElementById('enforce').checked = !!cfg.enforce_scopes;
     }}
+    document.getElementById('token-ep-display').textContent =
+      document.getElementById('issuer-display').textContent + '/token';
+    await refreshClients();
   }} catch (e) {{
     SS.clear();
     only('domain-form');
@@ -416,6 +613,18 @@ async function main() {{
   document.getElementById('back-btn').onclick = onBack;
   document.getElementById('workload-form').onsubmit = saveWorkload;
   document.getElementById('signout-btn').onclick = signOut;
+  document.getElementById('issue-btn').onclick = issueCredential;
+  document.getElementById('dismiss-secret-btn').onclick = () =>
+    document.getElementById('secret-panel').classList.add('hidden');
+  for (const b of document.querySelectorAll('[data-copy]')) {{
+    b.onclick = () => {{
+      navigator.clipboard.writeText(
+        document.getElementById(b.dataset.copy).textContent);
+      const t = b.textContent;
+      b.textContent = 'Copied';
+      setTimeout(() => b.textContent = t, 1500);
+    }};
+  }}
 
   const url = new URL(window.location.href);
   const code = url.searchParams.get('code');
