@@ -21,7 +21,7 @@ Design notes / demo simplifications:
     Tokens are lost on restart.
   - Client authentication at the token endpoint (private_key_jwt per Okta) is
     not required; we validate the ID-JAG ``client_id`` claim against the
-    tenant's ``workload_client_ids`` allow-list when one is configured.
+    tenant's XAA allow-list (``idjag_client_ids``) when one is configured.
 """
 
 from __future__ import annotations
@@ -230,10 +230,15 @@ class IdJagValidator:
 
         # 6. client_id must be permitted for this tenant.
         client_id = claims.get("client_id") or access.client_id or ""
-        if tenant.workload_client_ids and client_id not in tenant.workload_client_ids:
+        # Use the XAA allow-list (our client registry), NOT
+        # workload_client_ids — that one gates the direct Okta-token flow on
+        # /mcp, and conflating them means a change to either flow's config
+        # silently alters the other.
+        permitted = tenant.idjag_client_ids
+        if permitted and client_id not in permitted:
             logger.warning(
-                "ID-JAG rejected: client_id %r not in tenant allow-list %s",
-                client_id, tenant.workload_client_ids,
+                "ID-JAG rejected: client_id %r not in tenant XAA allow-list %s",
+                client_id, permitted,
             )
             raise IdJagError("invalid_grant", "assertion client_id is not permitted")
 

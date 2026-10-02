@@ -174,14 +174,10 @@ def register_oauth_routes(
                 f"only '{JWT_BEARER_GRANT}' is supported",
             )
 
-        assertion = (form.get("assertion") or "").strip()
-        if not assertion:
-            return _oauth_error("invalid_request", "missing 'assertion' parameter")
-
-        # Client authentication is mandatory. Reject a request carrying no
-        # credentials before doing any signature work. Credentials are verified
-        # against the tenant below, once the assertion has established which
-        # tenant this is.
+        # RFC 6749 §5.2: authenticate the client before processing the grant.
+        # Our client_ids are globally unique (we issue them), so the caller
+        # resolves to a tenant and an Okta client_id without reading the
+        # assertion at all.
         creds = _parse_client_auth(request, form)
         if creds is None:
             return _invalid_client(
@@ -190,6 +186,24 @@ def register_oauth_routes(
                 "parameters (client_secret_post)"
             )
         auth_client_id, auth_client_secret, auth_method = creds
+
+        found = store.find_client(auth_client_id)
+        client_record = (
+            found[0].authenticate_client(auth_client_id, auth_client_secret)
+            if found else None
+        )
+        if not client_record:
+            logger.warning(
+                "Client auth failed at /token (method=%s) for client_id=%r",
+                auth_method, auth_client_id,
+            )
+            return _invalid_client("client authentication failed")
+        client_tenant = found[0]
+        expected_okta_client_id = client_record.get("okta_client_id") or ""
+
+        assertion = (form.get("assertion") or "").strip()
+        if not assertion:
+            return _oauth_error("invalid_request", "missing 'assertion' parameter")
 
         try:
             claims = await validator.validate(assertion)
@@ -203,28 +217,31 @@ def register_oauth_routes(
             )
             return _oauth_error(e.oauth_error, e.description)
 
-        # The assertion is authentic, so claims.tenant_domain is trustworthy and
-        # names the tenant whose registered secret must match.
-        tenant = store.get(claims.tenant_domain)
-        if tenant is None or not tenant.verify_client(auth_client_id, auth_client_secret):
+        # Bind the credential to the assertion. The credential is registered
+        # for exactly one Okta app, so it may only redeem an ID-JAG issued to
+        # that app — otherwise any authenticated client could replay another's.
+        if claims.client_id != expected_okta_client_id:
             logger.warning(
-                "Client auth failed at /token (method=%s) for client_id=%r "
-                "tenant=%s", auth_method, auth_client_id, claims.tenant_domain,
-            )
-            return _invalid_client("client authentication failed")
-
-        # Bind the credential to the assertion: a registered client may only
-        # redeem an ID-JAG that was issued to itself. Without this check any
-        # authenticated client could replay another client's assertion.
-        if auth_client_id != claims.client_id:
-            logger.warning(
-                "Client/assertion mismatch at /token: authenticated as %r but "
-                "assertion client_id=%r (tenant=%s)",
-                auth_client_id, claims.client_id, claims.tenant_domain,
+                "Client/assertion mismatch at /token: credential %r is "
+                "registered for okta_client_id=%r but the assertion names %r",
+                auth_client_id, expected_okta_client_id, claims.client_id,
             )
             return _oauth_error(
                 "invalid_grant",
                 "assertion was not issued to the authenticated client",
+            )
+
+        # And it may only speak for its own tenant, so one customer's
+        # credential cannot redeem another customer's assertion.
+        if claims.tenant_domain != client_tenant.okta_domain:
+            logger.warning(
+                "Cross-tenant redemption blocked: credential %r belongs to %s "
+                "but the assertion resolved to %s",
+                auth_client_id, client_tenant.okta_domain, claims.tenant_domain,
+            )
+            return _oauth_error(
+                "invalid_grant",
+                "assertion does not belong to this client's tenant",
             )
 
         # Optional down-scoping: a requested 'scope' may only narrow, not widen.

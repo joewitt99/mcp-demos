@@ -582,13 +582,17 @@ def register_config_routes(
             "enforce_scopes": tenant.enforce_scopes,
         })
 
-    @mcp.custom_route("/config/client-secret", methods=["POST"])
-    async def client_secret_post(request: Request) -> Response:
-        """Generate (or rotate) the client secret for one workload client_id.
+    @mcp.custom_route("/config/clients", methods=["POST"])
+    async def clients_post(request: Request) -> Response:
+        """Register a workload app and issue OUR client_id + secret for it.
 
-        The plaintext is returned exactly once in this response and is never
-        stored or recoverable: only a salted hash is persisted. Rotating
-        invalidates the previous secret immediately.
+        Body: {"okta_client_id": "0oa..."} — the Okta app that will present
+        ID-JAGs. We mint a client_id in our own namespace and bind it to that
+        app, so /token can authenticate the caller before reading the
+        assertion and then require the assertion to name this exact app.
+
+        The secret is returned once here and never again: only a salted hash
+        is persisted.
         """
         token = _bearer_token(request)
         tenant = await _resolve_admin(token, store)
@@ -598,30 +602,34 @@ def register_config_routes(
             payload = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        client_id = (payload.get("client_id") or "").strip()
-        if not client_id:
-            return JSONResponse({"error": "missing client_id"}, status_code=400)
+        okta_client_id = (payload.get("okta_client_id") or "").strip()
+        if not okta_client_id:
+            return JSONResponse({"error": "missing okta_client_id"}, status_code=400)
 
-        rotated = client_id in tenant.workload_client_secrets
-        secret = tenant.set_client_secret(client_id)
-        store.save(tenant)
+        client_id, secret = tenant.register_client(okta_client_id)
+        try:
+            store.save(tenant)
+        except Exception as e:
+            logger.exception("SSM save failed")
+            return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
         logger.info(
-            "%s client secret for client_id=%s tenant=%s",
-            "Rotated" if rotated else "Issued", client_id, tenant.okta_domain,
+            "Issued client_id=%s for okta_client_id=%s tenant=%s",
+            client_id, okta_client_id, tenant.okta_domain,
         )
         return JSONResponse(
             {
                 "client_id": client_id,
                 "client_secret": secret,
-                "rotated": rotated,
-                "note": "Copy this now — it is not retrievable later.",
+                "okta_client_id": okta_client_id,
+                "token_endpoint": f"{(public_base_url or '').rstrip('/')}/token",
+                "note": "Copy the secret now — it is not retrievable later.",
             },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
 
-    @mcp.custom_route("/config/client-secret", methods=["GET"])
-    async def client_secret_get(request: Request) -> Response:
-        """Which workload clients have a secret registered. Never the secrets."""
+    @mcp.custom_route("/config/clients", methods=["GET"])
+    async def clients_get(request: Request) -> Response:
+        """List issued credentials. Never returns secrets."""
         token = _bearer_token(request)
         tenant = await _resolve_admin(token, store)
         if tenant is None:
@@ -630,11 +638,54 @@ def register_config_routes(
             "clients": [
                 {
                     "client_id": cid,
-                    "has_secret": cid in tenant.workload_client_secrets,
+                    "okta_client_id": rec.get("okta_client_id"),
+                    "created": rec.get("created"),
+                    "rotated": rec.get("rotated"),
                 }
-                for cid in tenant.workload_client_ids
+                for cid, rec in sorted(tenant.clients.items())
             ]
         })
+
+    @mcp.custom_route("/config/clients/rotate", methods=["POST"])
+    async def clients_rotate(request: Request) -> Response:
+        """Issue a new secret for an existing client_id, invalidating the old."""
+        token = _bearer_token(request)
+        tenant = await _resolve_admin(token, store)
+        if tenant is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        client_id = (payload.get("client_id") or "").strip()
+        secret = tenant.rotate_client_secret(client_id)
+        if secret is None:
+            return JSONResponse({"error": "unknown client_id"}, status_code=404)
+        store.save(tenant)
+        logger.info("Rotated secret for client_id=%s tenant=%s", client_id, tenant.okta_domain)
+        return JSONResponse(
+            {"client_id": client_id, "client_secret": secret,
+             "note": "Copy the secret now — it is not retrievable later."},
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    @mcp.custom_route("/config/clients/revoke", methods=["POST"])
+    async def clients_revoke(request: Request) -> Response:
+        """Delete a credential. The Okta app itself is untouched."""
+        token = _bearer_token(request)
+        tenant = await _resolve_admin(token, store)
+        if tenant is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        client_id = (payload.get("client_id") or "").strip()
+        if not tenant.revoke_client(client_id):
+            return JSONResponse({"error": "unknown client_id"}, status_code=404)
+        store.save(tenant)
+        logger.info("Revoked client_id=%s tenant=%s", client_id, tenant.okta_domain)
+        return JSONResponse({"status": "revoked", "client_id": client_id})
 
     @mcp.custom_route("/config/workload", methods=["POST"])
     async def workload_post(request: Request) -> Response:
@@ -675,14 +726,11 @@ def register_config_routes(
             custom_issuer=custom_issuer,
             audience=audience,
             workload_client_ids=client_ids,
-            # Carry existing secrets across the rewrite — dropping them would
-            # silently break every client that already authenticates. Secrets
-            # for client_ids removed from the allow-list are pruned here, so
-            # deleting a client_id also revokes its credential.
-            workload_client_secrets={
-                cid: h for cid, h in tenant.workload_client_secrets.items()
-                if cid in client_ids
-            },
+            # Carry the XAA client registry across untouched. Pruning it
+            # against workload_client_ids would mean editing the DIRECT-flow
+            # allow-list silently revokes ID-JAG credentials. Revoking is an
+            # explicit action: POST /config/clients/revoke.
+            clients=dict(tenant.clients),
             enforce_scopes=bool(payload.get("enforce_scopes", False)),
             idjag_issuer=idjag_issuer,
         )
