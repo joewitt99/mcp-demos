@@ -234,11 +234,21 @@ class IdJagValidator:
         # (direct Okta tokens on /mcp), and the two modes share nothing but
         # scopes, so reading it here would let one mode's config widen the
         # other's. Empty means any client_id may redeem.
-        permitted = tenant.idjag_client_ids
+        #
+        # The claim names the client *as registered with us*: when the admin
+        # pastes our generated client_id into Okta's connector, Okta mints
+        # assertions carrying that value — not the requesting app's Okta app
+        # id. So our own issued credential is always permitted, and the
+        # configured list is for additional ids. Observed in the wild as
+        # `client_id=samcp_...` being rejected against a list of Okta app ids.
+        permitted = list(tenant.idjag_client_ids)
+        if tenant.resource_client_id:
+            permitted.append(tenant.resource_client_id)
         if permitted and client_id not in permitted:
             logger.warning(
-                "ID-JAG rejected: client_id %r not in tenant XAA allow-list %s",
-                client_id, permitted,
+                "ID-JAG rejected: client_id %r not in tenant XAA allow-list %s "
+                "(our issued client_id is %r)",
+                client_id, permitted, tenant.resource_client_id,
             )
             raise IdJagError("invalid_grant", "assertion client_id is not permitted")
 
