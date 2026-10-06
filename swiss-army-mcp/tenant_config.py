@@ -13,8 +13,6 @@ Configuration:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -31,51 +29,27 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Resource server credentials
+# Resource server client_id
 #
-# Okta's resource server connector has two access methods. Cross App Access
-# (XAA) asks only for Resource URL / Issuer URL / Audience and sends no client
-# credentials. Brokered Consent asks for a Client ID, Client secret and
-# scopes, which the resource server must supply.
+# Okta's resource server connector asks for a Client ID when you register this
+# server, so we generate one. It is NOT a secret and not an authenticator:
+# nothing in the XAA flow ever presents it back to us as a credential.
 #
-# So we generate a credential — with no input, since the admin has nothing to
-# give us at that point — and client authentication at /token is OPTIONAL:
-# enforced when a request presents credentials, and skippable for pure XAA
-# unless the tenant sets require_client_auth.
+# It is load-bearing for a different reason. Once the admin pastes it into the
+# connector, Okta mints ID-JAGs whose `client_id` claim carries this value, so
+# idjag.py uses it to recognise the registered client (see its allow-list).
 #
-# Only a salted SHA-256 hash is persisted. The tenant blob is a plain SSM
-# String, so anything with ssm:GetParameter on the prefix can read it; a hash
-# keeps a leaked parameter from yielding a usable secret. Plain SHA-256 is
-# adequate for 256 bits of os.urandom, which is not a human-chosen password.
+# There is deliberately no client secret: trust in mode 2 comes from the
+# assertion's signature, validated against the tenant's Okta JWKS, plus
+# aud/exp/jti. A shared secret would add nothing, and storing one we never
+# check is worse than not having it.
 # ---------------------------------------------------------------------------
 
-_SECRET_SCHEME = "sha256"
 RESOURCE_CLIENT_PREFIX = "samcp_"
 
 
 def generate_client_id() -> str:
     return RESOURCE_CLIENT_PREFIX + secrets.token_urlsafe(16)
-
-
-def generate_client_secret() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def hash_client_secret(secret: str, *, salt: bytes | None = None) -> str:
-    salt = salt if salt is not None else secrets.token_bytes(16)
-    return f"{_SECRET_SCHEME}${salt.hex()}${hashlib.sha256(salt + secret.encode()).hexdigest()}"
-
-
-def verify_client_secret(secret: str, stored: str) -> bool:
-    try:
-        scheme, salt_hex, digest_hex = stored.split("$", 2)
-        salt = bytes.fromhex(salt_hex)
-    except ValueError:
-        return False
-    if scheme != _SECRET_SCHEME:
-        return False
-    expected = hashlib.sha256(salt + secret.encode()).hexdigest()
-    return hmac.compare_digest(expected, digest_hex)
 
 
 @dataclass
@@ -94,13 +68,10 @@ class Tenant:
     # workload_client_ids on purpose — the two modes share nothing but scopes,
     # so neither list may widen the other. Empty means allow any client_id.
     idjag_client_ids: list[str] = field(default_factory=list)
-    # Credential this server issues for Okta's Brokered Consent fields.
-    # {"client_id", "secret" (hash), "created", "rotated"}. Generated with no
-    # input — the admin has nothing to supply when registering us.
+    # client_id this server issues for Okta's connector form.
+    # {"client_id", "created"}. Generated with no input — the admin has
+    # nothing to supply when registering us. No secret: see above.
     resource_client: dict = field(default_factory=dict)
-    # When true, /token rejects a request that presents no credentials. Off by
-    # default so pure XAA (which sends none) keeps working.
-    require_client_auth: bool = False
     enforce_scopes: bool = False
     # Okta authorization-server URL that mints ID-JAG assertions (Cross-App
     # Access) for this customer. Often the same as ``custom_issuer``, but kept
@@ -109,39 +80,24 @@ class Tenant:
     # tenant. See ``idjag.py``.
     idjag_issuer: str | None = None
 
-    def issue_resource_credentials(self) -> tuple[str, str]:
-        """Generate (or rotate) this tenant's resource-server credential.
+    def issue_resource_client_id(self) -> str:
+        """Generate this tenant's resource-server client_id, once.
 
-        Takes no arguments: Okta has not given the admin anything to supply at
-        registration time. Keeps the existing client_id across a rotation so
-        the value already pasted into Okta stays valid. Returns the plaintext
-        secret for one-time display; only its hash is stored.
+        Idempotent: returns the existing value if one was already issued, so
+        the id already pasted into Okta's connector can never change out from
+        under it. Takes no arguments — Okta gives the admin nothing to supply
+        at registration time.
         """
-        rotating = bool(self.resource_client.get("client_id"))
-        client_id = self.resource_client.get("client_id") or generate_client_id()
-        secret = generate_client_secret()
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        self.resource_client = {
-            "client_id": client_id,
-            "secret": hash_client_secret(secret),
-            "created": self.resource_client.get("created") or now,
-        }
-        if rotating:
-            self.resource_client["rotated"] = now
-        return client_id, secret
-
-    def verify_resource_client(self, client_id: str, secret: str) -> bool:
-        """Constant-time check of presented credentials."""
-        rc = self.resource_client
-        if not rc or not client_id or not secret:
-            return False
-        if not hmac.compare_digest(client_id, rc.get("client_id") or ""):
-            return False
-        return verify_client_secret(secret, rc.get("secret") or "")
+        if not self.resource_client.get("client_id"):
+            self.resource_client = {
+                "client_id": generate_client_id(),
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        return self.resource_client["client_id"]
 
     @property
     def resource_client_id(self) -> str | None:
-        """The client_id, safe to redisplay. The secret is never recoverable."""
+        """The client_id Okta will echo in the ID-JAG's client_id claim."""
         return self.resource_client.get("client_id") or None
 
     @property
@@ -167,7 +123,6 @@ class Tenant:
             workload_client_ids=list(d.get("workload_client_ids") or []),
             idjag_client_ids=list(d.get("idjag_client_ids") or []),
             resource_client=dict(d.get("resource_client") or {}),
-            require_client_auth=bool(d.get("require_client_auth", False)),
             enforce_scopes=bool(d.get("enforce_scopes", False)),
             idjag_issuer=d.get("idjag_issuer") or None,
         )

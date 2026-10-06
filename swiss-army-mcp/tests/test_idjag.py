@@ -157,7 +157,7 @@ async def main():
     # names only Okta app ids. Okta mints assertions carrying the client_id the
     # admin pasted into the connector, which is ours.
     v = fresh_validator()
-    rc_id, _ = tenant.issue_resource_credentials()
+    rc_id = tenant.issue_resource_client_id()
     ours = {**good, "client_id": rc_id, "jti": "jrc1"}
     try:
         await v.validate(make_jag(**ours))
