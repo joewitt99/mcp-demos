@@ -7,6 +7,8 @@ for the validation and token-minting logic.
 
 Routes registered here:
   - GET  /.well-known/oauth-authorization-server   (RFC 8414 AS metadata)
+  - GET  /.well-known/jwks.json                    (RFC 7517 JWKS, empty:
+                                                    minted tokens are opaque)
   - GET  /.well-known/oauth-protected-resource     (RFC 9728 PRM, root)
   - GET  /.well-known/oauth-protected-resource/mcp (RFC 9728 PRM, path-based)
   - GET  /authorize                                (documented stub)
@@ -78,9 +80,31 @@ def register_oauth_routes(
             # No client authentication: the assertion is the grant
             # (RFC 7523), verified against the tenant's Okta JWKS.
             "token_endpoint_auth_methods_supported": ["none"],
+            # RFC 8414 lists jwks_uri as OPTIONAL, but spec-compliant clients
+            # (Okta's SDK among them) treat its absence as a reason to fall
+            # back to OIDC discovery at /.well-known/openid-configuration —
+            # which this server does not publish, so the fallback 404s with a
+            # text/plain body and the client dies parsing it as JSON. Always
+            # advertise the endpoint so discovery terminates here.
+            "jwks_uri": f"{issuer}/.well-known/jwks.json",
             "scopes_supported": ALL_SCOPES,
             "code_challenge_methods_supported": ["S256"],
         })
+
+    @mcp.custom_route("/.well-known/jwks.json", methods=["GET"])
+    async def jwks(_request: Request) -> Response:
+        # Deliberately an EMPTY key set. The access tokens this server mints
+        # are opaque (idjag.TokenStore), not signed JWTs, so there is no public
+        # key for a client to verify anything against — an empty `keys` array
+        # is the honest, spec-valid answer. The endpoint exists so RFC 8414
+        # discovery resolves rather than falling through to OIDC discovery.
+        #
+        # If we ever switch to signed JWTs, this must publish the real keys.
+        return JSONResponse(
+            {"keys": []},
+            media_type="application/jwk-set+json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
 
     # RFC 9728 §3.1 builds the metadata URL by inserting the *resource's path*
     # after the well-known segment, so the resource https://host/mcp is

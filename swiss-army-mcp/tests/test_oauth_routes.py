@@ -79,6 +79,29 @@ async def main():
             ck("AS grant types", m["grant_types_supported"] == ["urn:ietf:params:oauth:grant-type:jwt-bearer"])
             ck("AS id-jag profile", "urn:ietf:params:oauth:grant-profile:id-jag" in m["authorization_grant_profiles_supported"])
 
+            # RFC 8414 jwks_uri. Without it, spec-compliant clients (Okta's SDK
+            # included) fall back to OIDC discovery at
+            # /.well-known/openid-configuration, which this server does not
+            # publish — the 404 is text/plain and the client dies parsing it as
+            # JSON. Reported 2026-10-09 as blocking XAA hop 2.
+            ck("AS advertises jwks_uri", "jwks_uri" in m)
+            ck("jwks_uri is absolute under our issuer",
+               m.get("jwks_uri") == f"{ISSUER}/.well-known/jwks.json")
+
+            r = await client.get("/.well-known/jwks.json")
+            ck("JWKS endpoint 200", r.status_code == 200)
+            ck("JWKS is valid JSON with a keys array",
+               isinstance(r.json().get("keys"), list))
+            ck("JWKS keys empty (tokens are opaque, nothing to verify)",
+               r.json()["keys"] == [])
+            ck("JWKS content type is JSON",
+               "json" in (r.headers.get("content-type") or ""))
+
+            # the advertised URI must actually resolve — the whole point
+            from urllib.parse import urlparse as _up
+            r = await client.get(_up(m["jwks_uri"]).path)
+            ck("advertised jwks_uri resolves", r.status_code == 200)
+
             r = await client.get("/.well-known/oauth-protected-resource")
             p = r.json()
             ck("PRM 200", r.status_code == 200)
