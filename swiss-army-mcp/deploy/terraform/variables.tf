@@ -89,3 +89,14 @@ variable "log_retention_days" {
   type        = number
   default     = 14
 }
+
+variable "name" {
+  description = "Name prefix for every resource in this stack (ALB, target group, ECS cluster/service, IAM roles, SGs, log group). Must be unique per stack in the same account+region — change it when running a second instance alongside the first. Keep the default for the original stack so Terraform sees no renames."
+  type        = string
+  default     = "swiss-army-mcp"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9-]{1,28}$", var.name)) && !startswith(var.name, "-") && !endswith(var.name, "-")
+    error_message = "name must be 1-28 alphanumeric/hyphen characters and may not start or end with a hyphen (ALB and target group names are capped at 32 chars, and this module appends -alb / -task-sg)."
+  }
+}

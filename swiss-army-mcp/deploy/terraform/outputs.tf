@@ -37,3 +37,13 @@ output "public_subnet_ids" {
   description = "Public subnet IDs actually in use."
   value       = local.effective_public_subnets
 }
+
+output "name" {
+  description = "Name prefix used for this stack's resources."
+  value       = local.name
+}
+
+output "alb_dns_name" {
+  description = "ALB DNS name backing var.hostname."
+  value       = aws_lb.this.dns_name
+}

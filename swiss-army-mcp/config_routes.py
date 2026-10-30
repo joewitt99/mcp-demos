@@ -30,7 +30,7 @@ from okta_auth import (
     domain_from_issuer,
     peek_jwt_claims,
 )
-from scopes import TOOL_PREFIX_TO_SCOPE, WILDCARD_SCOPE
+from scopes import ALL_SCOPES, TOOL_PREFIX_TO_SCOPE, WILDCARD_SCOPE
 from tenant_config import Tenant, TenantStore
 
 logger = logging.getLogger(__name__)
@@ -41,12 +41,17 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 
 def _html(redirect_uri: str, issuer: str | None = None) -> str:
+    scope_list = " ".join(ALL_SCOPES)
     scope_rows = "\n          ".join(
         f"<tr><td><code>{prefix}*</code></td><td><code>{scope}</code></td></tr>"
         for prefix, scope in TOOL_PREFIX_TO_SCOPE.items()
     )
     wildcard_scope = WILDCARD_SCOPE
     issuer_display = issuer or "(set MCP_BASE_URL / MCP_ISSUER on the server)"
+    resource_display = (
+        issuer.rstrip("/") + "/mcp" if issuer
+        else "(set MCP_BASE_URL / MCP_ISSUER on the server)"
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -88,6 +93,13 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
     details.scope-ref table {{ width: 100%; border-collapse: collapse; margin-top: 0.25rem; }}
     details.scope-ref th, details.scope-ref td {{ padding: 0.3rem 0.5rem; text-align: left; border-bottom: 1px solid #eee; }}
     details.scope-ref th {{ font-weight: 600; color: #444; background: #fafafa; }}
+    .xaa-section {{ margin-top: 2.5rem; padding-top: 1.5rem; border-top: 2px solid #e5e5e5; }}
+    .xaa-section h2 {{ font-size: 1.1rem; margin: 0 0 0.35rem; }}
+    .xaa-field {{ margin-top: 0.9rem; }}
+    .xaa-field .xaa-label {{ font-weight: 500; font-size: 0.85rem; margin-bottom: 0.25rem; }}
+    .method-note {{ background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 6px;
+                    padding: 0.6rem 0.85rem; font-size: 0.82rem; color: #444;
+                    margin: 0.75rem 0 0; }}
   </style>
 </head>
 <body>
@@ -139,14 +151,73 @@ def _html(redirect_uri: str, issuer: str | None = None) -> str:
   <form id="workload-form" class="hidden">
     <div class="callout">Logged in as tenant <code id="logged-in-domain"></code>.</div>
 
-    <div class="callout">
-      <div style="margin-bottom: 0.5rem;"><strong>Cross-App-Access (ID-JAG):</strong>
-        set this server's issuer as the <code>aud</code> / audience when
-        configuring ID-JAG token exchange in Okta.</div>
-      <div class="redirect-box">
-        <code id="issuer-display">{issuer_display}</code>
-        <button type="button" class="copy-btn secondary" id="copy-issuer-btn">Copy</button>
+    <div class="xaa-section">
+      <h2>Cross-App-Access (XAA) connector values</h2>
+      <div class="subtle" style="margin-bottom: 0.5rem;">
+        Paste these into Okta when you add this server as a resource server
+        connector. XAA needs no client ID or secret &mdash; trust comes from the
+        ID-JAG's signature, which this server validates against your Okta JWKS.
       </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Resource URL</div>
+        <div class="redirect-box">
+          <code id="xaa-resource">{resource_display}</code>
+          <button type="button" class="copy-btn secondary" data-copy="xaa-resource">Copy</button>
+        </div>
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Issuer URL</div>
+        <div class="redirect-box">
+          <code id="issuer-display">{issuer_display}</code>
+          <button type="button" class="copy-btn secondary" data-copy="issuer-display">Copy</button>
+        </div>
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Audience / tenant ID</div>
+        <div class="redirect-box">
+          <code id="xaa-audience">{issuer_display}</code>
+          <button type="button" class="copy-btn secondary" data-copy="xaa-audience">Copy</button>
+        </div>
+        <div class="hint">This server requires the ID-JAG's <code>aud</code> to equal
+          this value exactly &mdash; no path, no trailing slash.</div>
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Scopes</div>
+        <div class="redirect-box">
+          <code id="xaa-scopes">{scope_list}</code>
+          <button type="button" class="copy-btn secondary" data-copy="xaa-scopes">Copy</button>
+        </div>
+      </div>
+
+      <div class="method-note">
+        <strong>No client secret.</strong> Cross App Access trusts the ID-JAG's
+        signature, which this server validates against your Okta JWKS &mdash; there is
+        nothing for a secret to prove, so none is issued. If Okta's form insists on a
+        value, anything will do: it is never sent to us and never checked.
+      </div>
+
+      <div class="xaa-field">
+        <div class="xaa-label">Client ID</div>
+        <div class="redirect-box">
+          <code id="rc-client-id">(not generated yet)</code>
+          <button type="button" class="copy-btn secondary" data-copy="rc-client-id">Copy</button>
+        </div>
+        <div class="hint" id="rc-meta"></div>
+      </div>
+
+      <button id="gen-creds-btn" type="button">Generate client ID</button>
+      <div id="rc-msg" class="msg hidden"></div>
+
+      <label for="idjag_clients">ID-JAG client IDs (optional, comma-separated)</label>
+      <input id="idjag_clients" type="text" placeholder="0oaXXXX...,0oaYYYY...">
+      <div class="hint">Okta apps allowed to redeem an ID-JAG here, matched against
+        the assertion's <code>client_id</code> claim. Leave empty to allow any.
+        Separate from Workload client IDs above, which governs direct
+        <code>/mcp</code> tokens &mdash; neither list affects the other.</div>
     </div>
 
     <label for="custom_issuer">Custom authorization server issuer</label>
@@ -310,6 +381,8 @@ async function saveWorkload(ev) {{
     idjag_issuer: document.getElementById('idjag_issuer').value.trim(),
     workload_client_ids: document.getElementById('clients').value
       .split(',').map(s => s.trim()).filter(Boolean),
+    idjag_client_ids: document.getElementById('idjag_clients').value
+      .split(',').map(s => s.trim()).filter(Boolean),
     enforce_scopes: document.getElementById('enforce').checked,
   }};
   try {{
@@ -330,6 +403,47 @@ async function saveWorkload(ev) {{
   }}
 }}
 
+async function generateClientId() {{
+  const btn = document.getElementById('gen-creds-btn');
+  btn.disabled = true;
+  msg('rc-msg', 'Generating…', 'ok');
+  try {{
+    const r = await fetch('/config/resource-client-id', {{
+      method: 'POST',
+      headers: {{ Authorization: 'Bearer ' + SS.getItem('access_token') }},
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    renderResourceClient(d);
+    msg('rc-msg', d.existing
+      ? 'Already issued — the same client ID is kept so Okta stays valid.'
+      : 'Client ID generated. Paste it into Okta.', 'ok');
+  }} catch (e) {{
+    msg('rc-msg', 'Failed: ' + e.message, 'err');
+  }} finally {{
+    btn.disabled = false;
+  }}
+}}
+
+function renderResourceClient(cfg) {{
+  const idEl = document.getElementById('rc-client-id');
+  const meta = document.getElementById('rc-meta');
+  const btn = document.getElementById('gen-creds-btn');
+  if (cfg && cfg.resource_client_id) {{
+    idEl.textContent = cfg.resource_client_id;
+    meta.textContent = 'Issued ' + (cfg.resource_client_created || 'unknown') +
+      ' \u00b7 Okta echoes this value in the ID-JAG client_id claim, so it is ' +
+      'kept stable and is safe to re-read at any time.';
+    btn.textContent = 'Client ID issued';
+    btn.disabled = true;
+  }} else {{
+    idEl.textContent = '(not generated yet)';
+    meta.textContent = 'Generate one if Okta asks for a Client ID when registering this server.';
+    btn.textContent = 'Generate client ID';
+    btn.disabled = false;
+  }}
+}}
+
 function signOut() {{
   SS.clear();
   window.location.href = '/config';
@@ -345,6 +459,7 @@ async function showWorkload() {{
       document.getElementById('audience').value = cfg.audience || '';
       document.getElementById('idjag_issuer').value = cfg.idjag_issuer || '';
       document.getElementById('clients').value = (cfg.workload_client_ids || []).join(',');
+      document.getElementById('idjag_clients').value = (cfg.idjag_client_ids || []).join(',');
       document.getElementById('enforce').checked = !!cfg.enforce_scopes;
     }}
   }} catch (e) {{
@@ -406,16 +521,20 @@ async function main() {{
     document.getElementById('copy-btn').textContent = 'Copied';
     setTimeout(() => document.getElementById('copy-btn').textContent = 'Copy', 1500);
   }};
-  document.getElementById('copy-issuer-btn').onclick = () => {{
-    navigator.clipboard.writeText(document.getElementById('issuer-display').textContent);
-    document.getElementById('copy-issuer-btn').textContent = 'Copied';
-    setTimeout(() => document.getElementById('copy-issuer-btn').textContent = 'Copy', 1500);
-  }};
+  for (const b of document.querySelectorAll('[data-copy]')) {{
+    b.onclick = () => {{
+      navigator.clipboard.writeText(
+        document.getElementById(b.dataset.copy).textContent);
+      b.textContent = 'Copied';
+      setTimeout(() => b.textContent = 'Copy', 1500);
+    }};
+  }}
   document.getElementById('domain-form').onsubmit = onDomainSubmit;
   document.getElementById('client-form').onsubmit = onClientSubmit;
   document.getElementById('back-btn').onclick = onBack;
   document.getElementById('workload-form').onsubmit = saveWorkload;
   document.getElementById('signout-btn').onclick = signOut;
+  document.getElementById('gen-creds-btn').onclick = generateClientId;
 
   const url = new URL(window.location.href);
   const code = url.searchParams.get('code');
@@ -579,7 +698,39 @@ def register_config_routes(
             "audience": tenant.audience,
             "idjag_issuer": tenant.idjag_issuer,
             "workload_client_ids": tenant.workload_client_ids,
+            "idjag_client_ids": tenant.idjag_client_ids,
+            "resource_client_id": tenant.resource_client_id,
+            "resource_client_created": tenant.resource_client.get("created"),
             "enforce_scopes": tenant.enforce_scopes,
+        })
+
+    @mcp.custom_route("/config/resource-client-id", methods=["POST"])
+    async def resource_client_id_post(request: Request) -> Response:
+        """Issue this tenant's resource-server client_id. Idempotent.
+
+        No body and no secret: XAA trusts the assertion's signature, so there
+        is nothing for a secret to prove. The id is stable once issued, because
+        Okta echoes it in the ID-JAG's client_id claim and the admin has
+        already pasted it into the connector.
+        """
+        token = _bearer_token(request)
+        tenant = await _resolve_admin(token, store)
+        if tenant is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        existing = bool(tenant.resource_client_id)
+        client_id = tenant.issue_resource_client_id()
+        if not existing:
+            try:
+                store.save(tenant)
+            except Exception as e:
+                logger.exception("SSM save failed")
+                return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
+            logger.info("Issued resource client_id=%s for tenant %s",
+                        client_id, tenant.okta_domain)
+        return JSONResponse({
+            "resource_client_id": client_id,
+            "resource_client_created": tenant.resource_client.get("created"),
+            "existing": existing,
         })
 
     @mcp.custom_route("/config/workload", methods=["POST"])
@@ -598,6 +749,10 @@ def register_config_routes(
         client_ids_raw = payload.get("workload_client_ids") or []
         if isinstance(client_ids_raw, str):
             client_ids_raw = [c.strip() for c in client_ids_raw.split(",")]
+        idjag_ids_raw = payload.get("idjag_client_ids") or []
+        if isinstance(idjag_ids_raw, str):
+            idjag_ids_raw = [c.strip() for c in idjag_ids_raw.split(",")]
+        idjag_ids = [c for c in idjag_ids_raw if c]
         client_ids = [c for c in client_ids_raw if c]
         if not custom_issuer or not audience:
             return JSONResponse(
@@ -621,6 +776,11 @@ def register_config_routes(
             custom_issuer=custom_issuer,
             audience=audience,
             workload_client_ids=client_ids,
+            idjag_client_ids=idjag_ids,
+            # Carry the client_id across the rewrite — losing it would break
+            # the value already pasted into Okta's connector, and with it the
+            # allow-list match on the ID-JAG's client_id claim.
+            resource_client=dict(tenant.resource_client),
             enforce_scopes=bool(payload.get("enforce_scopes", False)),
             idjag_issuer=idjag_issuer,
         )

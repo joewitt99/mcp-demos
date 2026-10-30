@@ -2,6 +2,13 @@
 
 aws_region = "us-east-1"
 
+# ---- Stack name ----
+# Prefixes every resource (ALB, target group, ECS cluster/service, IAM roles,
+# SGs, log group). Must be unique per stack within an account+region. Leave at
+# the default for your first stack; set a distinct value for each additional
+# stack you run alongside it (see second-instance.tfvars.example).
+# name = "swiss-army-mcp"
+
 # ---- DNS + TLS (existing) ----
 hostname       = "swiss-army-mcp.bridge.oktaproserv.com"
 cert_arn       = "arn:aws:acm:us-east-1:<account>:certificate/<id>"

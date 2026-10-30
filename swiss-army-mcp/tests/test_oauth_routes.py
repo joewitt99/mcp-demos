@@ -52,7 +52,8 @@ async def main():
     store._by_domain = {}; store._by_workload_issuer = {}; store._by_idjag_issuer = {}
     t = Tenant(okta_domain="acme.okta.com", admin_client_id="0oaAdmin",
                custom_issuer=IDP, audience="api://default",
-               workload_client_ids=["client-abc"], idjag_issuer=IDP)
+               workload_client_ids=["direct-app"],
+               idjag_client_ids=["client-abc"], idjag_issuer=IDP)
     store._by_domain[t.okta_domain] = t
     store._by_workload_issuer[IDP] = t; store._by_idjag_issuer[IDP] = t
 
@@ -78,10 +79,33 @@ async def main():
             ck("AS grant types", m["grant_types_supported"] == ["urn:ietf:params:oauth:grant-type:jwt-bearer"])
             ck("AS id-jag profile", "urn:ietf:params:oauth:grant-profile:id-jag" in m["authorization_grant_profiles_supported"])
 
+            # RFC 8414 jwks_uri. Without it, spec-compliant clients (Okta's SDK
+            # included) fall back to OIDC discovery at
+            # /.well-known/openid-configuration, which this server does not
+            # publish — the 404 is text/plain and the client dies parsing it as
+            # JSON. Reported 2026-10-09 as blocking XAA hop 2.
+            ck("AS advertises jwks_uri", "jwks_uri" in m)
+            ck("jwks_uri is absolute under our issuer",
+               m.get("jwks_uri") == f"{ISSUER}/.well-known/jwks.json")
+
+            r = await client.get("/.well-known/jwks.json")
+            ck("JWKS endpoint 200", r.status_code == 200)
+            ck("JWKS is valid JSON with a keys array",
+               isinstance(r.json().get("keys"), list))
+            ck("JWKS keys empty (tokens are opaque, nothing to verify)",
+               r.json()["keys"] == [])
+            ck("JWKS content type is JSON",
+               "json" in (r.headers.get("content-type") or ""))
+
+            # the advertised URI must actually resolve — the whole point
+            from urllib.parse import urlparse as _up
+            r = await client.get(_up(m["jwks_uri"]).path)
+            ck("advertised jwks_uri resolves", r.status_code == 200)
+
             r = await client.get("/.well-known/oauth-protected-resource")
             p = r.json()
             ck("PRM 200", r.status_code == 200)
-            ck("PRM resource", p["resource"] == f"{ISSUER}/mcp/")
+            ck("PRM resource", p["resource"] == f"{ISSUER}/mcp")
             ck("PRM auth servers", p["authorization_servers"] == [ISSUER])
 
             r = await client.get("/authorize")
@@ -107,6 +131,19 @@ async def main():
             ck("bad grant -> unsupported_grant_type", r.json()["error"] == "unsupported_grant_type")
 
             # missing assertion
+            # RFC 9728 §3.1: the PRM lives at the well-known prefix + the
+            # resource's path. This is the URL the 401 challenge advertises and
+            # the first one MCP clients fetch, so it must resolve — serving only
+            # the root path 404'd every spec-compliant client's discovery.
+            r = await client.get("/.well-known/oauth-protected-resource/mcp")
+            ck("PRM path-based 200", r.status_code == 200)
+            ck("PRM path-based resource", r.json()["resource"] == f"{ISSUER}/mcp")
+
+            r = await client.get("/.well-known/oauth-protected-resource")
+            ck("PRM root 200", r.status_code == 200)
+            ck("PRM root resource no trailing slash", r.json()["resource"] == f"{ISSUER}/mcp")
+            ck("PRM root authz server", r.json()["authorization_servers"] == [ISSUER])
+
             r = await client.post("/token", data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer"})
             ck("missing assertion -> invalid_request", r.json()["error"] == "invalid_request")
 
@@ -116,6 +153,75 @@ async def main():
             r = await client.post("/token", data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jag2})
             ck("bad aud -> invalid_grant 400", r.status_code == 400 and r.json()["error"] == "invalid_grant")
+
+            # ---- XAA takes no client credentials (Okta does not issue or
+            # collect any for Cross App Access), so redemption must succeed on
+            # the assertion alone. ----
+            now2 = int(time.time())
+            jag3 = make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="client-abc",
+                            jti="na1", exp=now2 + 300, iat=now2,
+                            scope="swiss-army-mcp:text")
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag3})
+            ck("redeems with no client credentials", r.status_code == 200)
+
+            # sending credentials must not break it either — they are ignored
+            jag4 = make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="client-abc",
+                            jti="na2", exp=now2 + 300, iat=now2)
+            r = await client.post("/token",
+                headers={"Authorization": "Basic " + base64.b64encode(b"x:y").decode()},
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                      "assertion": jag4})
+            ck("stray credentials ignored (no client auth)", r.status_code == 200)
+
+            m3 = (await client.get("/.well-known/oauth-authorization-server")).json()
+            ck("metadata advertises no client auth",
+               m3["token_endpoint_auth_methods_supported"] == ["none"])
+
+            # ---- resource client_id: issued, stable, not a credential ----
+            RC_ID = t.issue_resource_client_id()
+            ck("client_id generated without input", RC_ID.startswith("samcp_"))
+            ck("client_id redisplayable", t.resource_client_id == RC_ID)
+            ck("issuing is idempotent", t.issue_resource_client_id() == RC_ID)
+            ck("survives SSM round-trip",
+               Tenant.from_json(t.to_json()).resource_client_id == RC_ID)
+
+            # Okta echoes our client_id in the assertion; it must be permitted
+            # even when the configured allow-list names other ids.
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": make_jag(iss=IDP, sub="U9", aud=ISSUER,
+                                      client_id=RC_ID, jti="rc1",
+                                      exp=now2 + 300, iat=now2)})
+            ck("our client_id redeems", r.status_code == 200)
+
+            # No secret anywhere: nothing to present, nothing stored.
+            ck("no secret in the tenant blob", "secret" not in t.to_json())
+
+            # ---- the two modes share nothing but scopes ----
+            td = Tenant(okta_domain="d.okta.com", admin_client_id="0oaD",
+                        custom_issuer=IDP, audience="api://default",
+                        workload_client_ids=["direct-only"],
+                        idjag_client_ids=["xaa-only"])
+            ck("mode 1 list is its own", td.workload_client_ids == ["direct-only"])
+            ck("mode 2 list is its own", td.idjag_client_ids == ["xaa-only"])
+            ck("mode 2 does not see mode 1's apps",
+               "direct-only" not in td.idjag_client_ids)
+            ck("mode 1 does not see mode 2's apps",
+               "xaa-only" not in td.workload_client_ids)
+            ck("both survive SSM round-trip",
+               Tenant.from_json(td.to_json()).idjag_client_ids == ["xaa-only"]
+               and Tenant.from_json(td.to_json()).workload_client_ids == ["direct-only"])
+
+            # an ID-JAG from a client only on mode 1's list must be rejected
+            jag5 = make_jag(iss=IDP, sub="U9", aud=ISSUER, client_id="direct-app",
+                            jti="na3", exp=now2 + 300, iat=now2)
+            r = await client.post("/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jag5})
+            ck("mode 1 app cannot redeem an ID-JAG",
+               r.status_code == 400 and r.json()["error"] == "invalid_grant")
 
     nf = sum(1 for _, c in results if not c)
     print(f"\n{len(results)-nf}/{len(results)} passed")

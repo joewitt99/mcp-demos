@@ -1,7 +1,7 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  name              = "swiss-army-mcp"
+  name              = var.name
   container_port    = 8000
   mcp_base_url      = "https://${var.hostname}"
   tenants_prefix    = var.tenants_prefix
@@ -18,8 +18,9 @@ locals {
   effective_assign_public_ip = var.create_vpc ? true : var.assign_public_ip
 
   tags = {
-    project = "swiss-army-mcp"
-    managed = "terraform"
+    project  = "swiss-army-mcp"
+    instance = var.name
+    managed  = "terraform"
   }
 }
 

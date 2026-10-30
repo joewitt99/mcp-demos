@@ -7,7 +7,10 @@ for the validation and token-minting logic.
 
 Routes registered here:
   - GET  /.well-known/oauth-authorization-server   (RFC 8414 AS metadata)
-  - GET  /.well-known/oauth-protected-resource     (RFC 9728 PRM)
+  - GET  /.well-known/jwks.json                    (RFC 7517 JWKS, empty:
+                                                    minted tokens are opaque)
+  - GET  /.well-known/oauth-protected-resource     (RFC 9728 PRM, root)
+  - GET  /.well-known/oauth-protected-resource/mcp (RFC 9728 PRM, path-based)
   - GET  /authorize                                (documented stub)
   - POST /token                                    (jwt-bearer / ID-JAG)
 """
@@ -15,6 +18,7 @@ Routes registered here:
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlparse
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -73,19 +77,65 @@ def register_oauth_routes(
             "grant_types_supported": [JWT_BEARER_GRANT],
             "authorization_grant_profiles_supported": [ID_JAG_GRANT_PROFILE],
             "response_types_supported": [],
+            # No client authentication: the assertion is the grant
+            # (RFC 7523), verified against the tenant's Okta JWKS.
             "token_endpoint_auth_methods_supported": ["none"],
+            # RFC 8414 lists jwks_uri as OPTIONAL, but spec-compliant clients
+            # (Okta's SDK among them) treat its absence as a reason to fall
+            # back to OIDC discovery at /.well-known/openid-configuration —
+            # which this server does not publish, so the fallback 404s with a
+            # text/plain body and the client dies parsing it as JSON. Always
+            # advertise the endpoint so discovery terminates here.
+            "jwks_uri": f"{issuer}/.well-known/jwks.json",
             "scopes_supported": ALL_SCOPES,
             "code_challenge_methods_supported": ["S256"],
         })
 
-    @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
-    async def protected_resource_metadata(_request: Request) -> Response:
+    @mcp.custom_route("/.well-known/jwks.json", methods=["GET"])
+    async def jwks(_request: Request) -> Response:
+        # Deliberately an EMPTY key set. The access tokens this server mints
+        # are opaque (idjag.TokenStore), not signed JWTs, so there is no public
+        # key for a client to verify anything against — an empty `keys` array
+        # is the honest, spec-valid answer. The endpoint exists so RFC 8414
+        # discovery resolves rather than falling through to OIDC discovery.
+        #
+        # If we ever switch to signed JWTs, this must publish the real keys.
+        return JSONResponse(
+            {"keys": []},
+            media_type="application/jwk-set+json",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    # RFC 9728 §3.1 builds the metadata URL by inserting the *resource's path*
+    # after the well-known segment, so the resource https://host/mcp is
+    # described at /.well-known/oauth-protected-resource/mcp. That is the URL
+    # the 401 challenge advertises in `resource_metadata`, and what MCP clients
+    # fetch first (mcp/client/auth/utils.py tries path-based, then root-based).
+    # Serving only the root path made every spec-compliant client 404 on
+    # discovery, so register both.
+    _resource_path = urlparse(resource_url).path.rstrip("/")
+    _prm_paths = ["/.well-known/oauth-protected-resource"]
+    if _resource_path:
+        _prm_paths.append(f"/.well-known/oauth-protected-resource{_resource_path}")
+
+    def _prm_body() -> Response:
         return JSONResponse({
-            "resource": resource_url,
+            # Must match the resource identifier in the challenge, which the
+            # SDK derives without a trailing slash.
+            "resource": resource_url.rstrip("/"),
             "authorization_servers": [issuer],
             "scopes_supported": ALL_SCOPES,
             "bearer_methods_supported": ["header"],
         })
+
+    for _i, _prm_path in enumerate(_prm_paths):
+        # Bind the handler per iteration and give each a distinct __name__ so
+        # neither registration shadows the other.
+        async def protected_resource_metadata(_request: Request) -> Response:
+            return _prm_body()
+
+        protected_resource_metadata.__name__ = f"protected_resource_metadata_{_i}"
+        mcp.custom_route(_prm_path, methods=["GET"])(protected_resource_metadata)
 
     @mcp.custom_route("/authorize", methods=["GET"])
     async def authorize(_request: Request) -> Response:

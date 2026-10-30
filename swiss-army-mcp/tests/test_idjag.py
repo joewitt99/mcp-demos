@@ -84,7 +84,8 @@ def make_store():
         admin_client_id="0oaAdmin",
         custom_issuer=IDP,
         audience="api://default",
-        workload_client_ids=["client-abc"],
+        workload_client_ids=["direct-app"],
+        idjag_client_ids=["client-abc"],
         enforce_scopes=True,
         idjag_issuer=IDP,
     )
@@ -151,6 +152,18 @@ async def main():
         check("unknown issuer rejected", False)
     except idjag.IdJagError:
         check("unknown issuer rejected", True)
+
+    # Our own issued client_id is accepted even though the configured list
+    # names only Okta app ids. Okta mints assertions carrying the client_id the
+    # admin pasted into the connector, which is ours.
+    v = fresh_validator()
+    rc_id = tenant.issue_resource_client_id()
+    ours = {**good, "client_id": rc_id, "jti": "jrc1"}
+    try:
+        await v.validate(make_jag(**ours))
+        check("our issued client_id permitted", True)
+    except idjag.IdJagError as e:
+        check("our issued client_id permitted", False)
 
     # client_id not allowed
     v = fresh_validator()

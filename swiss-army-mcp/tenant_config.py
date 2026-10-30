@@ -16,14 +16,40 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import threading
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Resource server client_id
+#
+# Okta's resource server connector asks for a Client ID when you register this
+# server, so we generate one. It is NOT a secret and not an authenticator:
+# nothing in the XAA flow ever presents it back to us as a credential.
+#
+# It is load-bearing for a different reason. Once the admin pastes it into the
+# connector, Okta mints ID-JAGs whose `client_id` claim carries this value, so
+# idjag.py uses it to recognise the registered client (see its allow-list).
+#
+# There is deliberately no client secret: trust in mode 2 comes from the
+# assertion's signature, validated against the tenant's Okta JWKS, plus
+# aud/exp/jti. A shared secret would add nothing, and storing one we never
+# check is worse than not having it.
+# ---------------------------------------------------------------------------
+
+RESOURCE_CLIENT_PREFIX = "samcp_"
+
+
+def generate_client_id() -> str:
+    return RESOURCE_CLIENT_PREFIX + secrets.token_urlsafe(16)
 
 
 @dataclass
@@ -34,7 +60,18 @@ class Tenant:
     admin_client_id: str
     custom_issuer: str | None = None
     audience: str | None = None
+    # Mode 1 (direct Okta access tokens on /mcp): Okta apps whose tokens are
+    # accepted, matched against the `cid` claim.
     workload_client_ids: list[str] = field(default_factory=list)
+    # Mode 2 (ID-JAG redeemed at /token): Okta apps permitted to redeem an
+    # assertion, matched against the ID-JAG's `client_id` claim. Separate from
+    # workload_client_ids on purpose — the two modes share nothing but scopes,
+    # so neither list may widen the other. Empty means allow any client_id.
+    idjag_client_ids: list[str] = field(default_factory=list)
+    # client_id this server issues for Okta's connector form.
+    # {"client_id", "created"}. Generated with no input — the admin has
+    # nothing to supply when registering us. No secret: see above.
+    resource_client: dict = field(default_factory=dict)
     enforce_scopes: bool = False
     # Okta authorization-server URL that mints ID-JAG assertions (Cross-App
     # Access) for this customer. Often the same as ``custom_issuer``, but kept
@@ -42,6 +79,26 @@ class Tenant:
     # set, ID-JAGs whose ``iss`` matches this value are dispatched to this
     # tenant. See ``idjag.py``.
     idjag_issuer: str | None = None
+
+    def issue_resource_client_id(self) -> str:
+        """Generate this tenant's resource-server client_id, once.
+
+        Idempotent: returns the existing value if one was already issued, so
+        the id already pasted into Okta's connector can never change out from
+        under it. Takes no arguments — Okta gives the admin nothing to supply
+        at registration time.
+        """
+        if not self.resource_client.get("client_id"):
+            self.resource_client = {
+                "client_id": generate_client_id(),
+                "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        return self.resource_client["client_id"]
+
+    @property
+    def resource_client_id(self) -> str | None:
+        """The client_id Okta will echo in the ID-JAG's client_id claim."""
+        return self.resource_client.get("client_id") or None
 
     @property
     def has_workload_config(self) -> bool:
@@ -64,6 +121,8 @@ class Tenant:
             custom_issuer=d.get("custom_issuer") or None,
             audience=d.get("audience") or None,
             workload_client_ids=list(d.get("workload_client_ids") or []),
+            idjag_client_ids=list(d.get("idjag_client_ids") or []),
+            resource_client=dict(d.get("resource_client") or {}),
             enforce_scopes=bool(d.get("enforce_scopes", False)),
             idjag_issuer=d.get("idjag_issuer") or None,
         )
