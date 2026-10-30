@@ -81,12 +81,19 @@ for production.
 sudo yum install -y git yum-utils
 sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
 sudo yum install -y terraform
-git clone https://github.com/<you>/mcp-demos.git
+git clone -b main https://github.com/<you>/mcp-demos.git
 cd mcp-demos/swiss-army-mcp/deploy/terraform
 cp customer.tfvars.example terraform.tfvars
 $EDITOR terraform.tfvars
 terraform init
 terraform apply
+```
+
+Everything ships on `main`. If a host is still tracking an old feature branch,
+switch it before applying:
+
+```bash
+git checkout main && git pull
 ```
 
 Outputs include the MCP URL, the `/config` URL, and the redirect URI that
@@ -118,6 +125,10 @@ The settings persist to SSM under `/swiss-army-mcp/tenants/<their-domain>`.
 
 - **State**: this module uses local state. For team/CI use, configure an
   S3 backend.
-- **Image upgrades**: bump `image_tag` (e.g. `0.5.0`) and re-apply. ECS does a
-  rolling deploy of the new task definition revision.
+- **Image upgrades**: bump `image_tag` (e.g. `1.3.0`) and re-apply. ECS does a
+  rolling deploy of the new task definition revision. The tag must be one that
+  exists on Docker Hub *before* you apply — Terraform only writes the
+  reference, and Fargate pulls at task start, so a missing tag fails quietly:
+  the new task never passes `/healthz`, the ALB keeps serving the old
+  revision, and `terraform apply` still reports success.
 - **Cost**: ALB + a single Fargate task. No per-customer infrastructure.
