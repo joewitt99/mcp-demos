@@ -1,0 +1,59 @@
+output "api_base_url" {
+  description = "Base URL of the REST API (the OpenAPI `servers` entry)."
+  value       = "https://${var.hostname}"
+}
+
+output "openapi_url" {
+  description = "OpenAPI document to import into the Bridge."
+  value       = "https://${var.hostname}/openapi.json"
+}
+
+output "docs_url" {
+  description = "Swagger UI."
+  value       = "https://${var.hostname}/docs"
+}
+
+output "config_url" {
+  description = "Self-service tenant setup page."
+  value       = "https://${var.hostname}/config"
+}
+
+output "redirect_uri" {
+  description = "Customers add this as a redirect URI on their admin Okta SPA."
+  value       = "https://${var.hostname}/config/callback"
+}
+
+output "tenants_prefix" {
+  description = "SSM prefix under which per-tenant configs live."
+  value       = var.tenants_prefix
+}
+
+output "ecs_service" {
+  description = "ECS service identifier."
+  value       = "${aws_ecs_cluster.this.name}/${aws_ecs_service.this.name}"
+}
+
+output "log_group" {
+  description = "CloudWatch log group for the task."
+  value       = aws_cloudwatch_log_group.this.name
+}
+
+output "vpc_id" {
+  description = "VPC ID actually in use (created or bring-your-own)."
+  value       = local.effective_vpc_id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs actually in use."
+  value       = local.effective_public_subnets
+}
+
+output "name" {
+  description = "Name prefix used for this stack's resources."
+  value       = local.name
+}
+
+output "alb_dns_name" {
+  description = "ALB DNS name backing var.hostname."
+  value       = aws_lb.this.dns_name
+}
