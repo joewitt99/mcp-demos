@@ -194,7 +194,13 @@ curl -i -X POST https://<your-host>/mcp/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
 
-Run the offline logic test with `python tests/test_idjag.py`.
+Run the offline tests after installing the dev requirements:
+
+```bash
+pip install -r requirements-dev.txt
+python tests/test_idjag.py
+python tests/test_oauth_routes.py
+```
 
 ## Running from source
 
