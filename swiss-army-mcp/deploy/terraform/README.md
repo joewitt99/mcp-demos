@@ -125,7 +125,7 @@ The settings persist to SSM under `/swiss-army-mcp/tenants/<their-domain>`.
 
 - **State**: this module uses local state. For team/CI use, configure an
   S3 backend.
-- **Image upgrades**: bump `image_tag` (e.g. `1.3.0`) and re-apply. ECS does a
+- **Image upgrades**: bump `image_tag` (e.g. `1.3.1`) and re-apply. ECS does a
   rolling deploy of the new task definition revision. The tag must be one that
   exists on Docker Hub *before* you apply — Terraform only writes the
   reference, and Fargate pulls at task start, so a missing tag fails quietly:
